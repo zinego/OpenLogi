@@ -259,13 +259,14 @@ mod tests {
     use std::sync::RwLock;
 
     use openlogi_agent_core::DpiCycleState;
-    use openlogi_agent_core::hook_runtime::HookMaps;
+    use openlogi_agent_core::hook_runtime::{HookMaps, ScrollInversions};
     use openlogi_agent_core::receiver_access::ReceiverAccess;
     use openlogi_agent_core::watchers::gesture::CaptureEpoch;
 
     fn shared_runtime() -> SharedRuntime {
         SharedRuntime {
             hook_maps: Arc::new(RwLock::new(HookMaps::default())),
+            scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
             gesture_bindings: Arc::new(RwLock::new(
                 openlogi_agent_core::watchers::gesture::GestureBindingState::default(),
             )),

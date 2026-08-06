@@ -567,6 +567,7 @@ thread_local! {
 /// granted or on an unsupported platform — the app continues without crashing.
 pub fn start(
     hooks: SharedHookMaps,
+    scroll_inversions: SharedScrollInversions,
     dpi_cycle: Arc<RwLock<DpiCycleState>>,
     capture: CaptureChannel,
     monitor: SharedEventMonitor,
@@ -583,6 +584,7 @@ pub fn start(
 
     let context = HookContext {
         hooks,
+        scroll_inversions,
         action_emitter: ActionEmitter::new(dpi_cycle, capture),
         monitor,
         pan_emitter,
@@ -607,6 +609,7 @@ pub fn start(
 
 struct HookContext {
     hooks: SharedHookMaps,
+    scroll_inversions: SharedScrollInversions,
     action_emitter: ActionEmitter,
     monitor: SharedEventMonitor,
     pan_emitter: PanEmitter,
@@ -626,7 +629,17 @@ fn handle_event(context: &HookContext, event: &MouseEvent) -> EventDisposition {
             let _ = HOLD.with_borrow_mut(HoldState::cancel);
             EventDisposition::PassThrough
         }
-        MouseEvent::Scroll { .. } => EventDisposition::PassThrough,
+        MouseEvent::Scroll {
+            delta_y,
+            from_trackpad,
+            device,
+            ..
+        } => scroll_disposition(
+            *delta_y,
+            *from_trackpad,
+            device.as_ref(),
+            &context.scroll_inversions,
+        ),
     }
 }
 
@@ -822,6 +835,7 @@ mod tests {
                     }),
                 )]),
             })),
+            scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
             action_emitter: ActionEmitter { queue },
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
@@ -839,6 +853,7 @@ mod tests {
                     bindings: BTreeMap::from([(ButtonId::Back, Action::Copy)]),
                     gestures: BTreeMap::new(),
                 })),
+                scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
                 action_emitter: ActionEmitter { queue },
                 monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
                 pan_emitter: PanEmitter::new(),
@@ -912,6 +927,7 @@ mod tests {
                     )])),
                 )]),
             })),
+            scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
             action_emitter: ActionEmitter {
                 queue: directional_queue,
             },
@@ -1145,6 +1161,7 @@ mod tests {
                         }),
                     )]),
                 })),
+                scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
                 action_emitter: ActionEmitter { queue },
                 monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
                 pan_emitter: PanEmitter::new(),
@@ -1202,6 +1219,7 @@ mod tests {
                     }),
                 )]),
             })),
+            scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
             action_emitter: ActionEmitter { queue },
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
@@ -1258,6 +1276,7 @@ mod tests {
                     })
                     .collect(),
             })),
+            scroll_inversions: Arc::new(RwLock::new(ScrollInversions::default())),
             action_emitter: ActionEmitter { queue },
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
