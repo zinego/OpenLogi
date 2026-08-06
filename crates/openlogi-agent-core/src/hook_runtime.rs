@@ -87,8 +87,10 @@ pub struct ScrollDeviceKey {
 
 /// Per-device software scroll inversion settings.
 ///
-/// Product ids are matched exactly before normalized product names. Conflicting
-/// settings for the same identity are retained as ambiguous and never match.
+/// A reported product id is authoritative and must match exactly; normalized
+/// product names are considered only when the event has no product id.
+/// Conflicting settings for the same identity are retained as ambiguous and
+/// never match.
 #[derive(Default)]
 pub struct ScrollInversions {
     by_product_id: BTreeMap<(u32, u32), Option<bool>>,
@@ -123,10 +125,13 @@ impl ScrollInversions {
     #[must_use]
     pub fn inversion_for(&self, device: Option<&EventDevice>) -> Option<bool> {
         let device = device?;
-        if let (Some(vendor_id), Some(product_id)) = (device.vendor_id, device.product_id)
-            && let Some(invert) = self.by_product_id.get(&(vendor_id, product_id))
-        {
-            return *invert;
+        if let Some(product_id) = device.product_id {
+            let vendor_id = device.vendor_id?;
+            return self
+                .by_product_id
+                .get(&(vendor_id, product_id))
+                .copied()
+                .flatten();
         }
 
         let product_name = device
@@ -223,12 +228,15 @@ pub fn scroll_disposition(
     device: Option<&EventDevice>,
     scroll_inversions: &SharedScrollInversions,
 ) -> EventDisposition {
+    if from_trackpad || delta_y == 0.0 {
+        return EventDisposition::PassThrough;
+    }
     let should_invert = scroll_inversions
         .read()
         .ok()
         .and_then(|inversions| inversions.inversion_for(device))
         .unwrap_or(false);
-    if should_invert && !from_trackpad && delta_y != 0.0 {
+    if should_invert {
         inverted_scroll_disposition()
     } else {
         EventDisposition::PassThrough
@@ -1449,6 +1457,36 @@ mod tests {
         };
 
         assert_eq!(inversions.inversion_for(Some(&event)), Some(true));
+    }
+
+    #[test]
+    fn scroll_inversions_do_not_fall_back_to_name_after_product_id_miss() {
+        let inversions = Arc::new(RwLock::new(ScrollInversions::new([(
+            ScrollDeviceKey {
+                vendor_id: Some(0x046d),
+                product_id: Some(0xb037),
+                product_name: Some("M650".to_string()),
+            },
+            true,
+        )])));
+        let event = EventDevice {
+            vendor_id: Some(0x046d),
+            product_id: Some(0xb042),
+            product_name: Some("M650".to_string()),
+        };
+
+        assert_eq!(
+            inversions
+                .read()
+                .ok()
+                .and_then(|settings| settings.inversion_for(Some(&event))),
+            None,
+            "a reported product id makes name fallback unsafe"
+        );
+        assert_eq!(
+            scroll_disposition(1.0, false, Some(&event), &inversions),
+            EventDisposition::PassThrough
+        );
     }
 
     #[test]
