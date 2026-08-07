@@ -143,11 +143,6 @@ fn pan_scroll_event(delta_x: i32, delta_y: i32) -> Option<PanScrollEvent> {
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-const fn smart_magnify_event_type() -> u32 {
-    32
-}
-
 /// Return the `/dev/input/eventN` node for the action-injector uinput device,
 /// initialising it if needed.
 ///
@@ -283,7 +278,7 @@ fn mac_virtual_key_to_windows(key_code: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PanScrollEvent, PanScrollUnit, pan_scroll_event, smart_magnify_event_type};
+    use super::{PanScrollEvent, PanScrollUnit, pan_scroll_event};
 
     #[test]
     fn pan_scroll_maps_both_mouse_axes_to_pixel_content_motion() {
@@ -325,11 +320,6 @@ mod tests {
         };
         assert_eq!(event.horizontal, i32::MAX);
         assert_eq!(event.vertical, i32::MAX);
-    }
-
-    #[test]
-    fn smart_zoom_uses_the_native_smart_magnify_event_type() {
-        assert_eq!(smart_magnify_event_type(), 32);
     }
 
     #[test]

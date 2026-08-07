@@ -30,6 +30,7 @@ const VK_V: u16 = 0x09;
 const VK_W: u16 = 0x0D;
 const VK_X: u16 = 0x07;
 const VK_Z: u16 = 0x06;
+const VK_EQUAL: u16 = 0x18;
 const VK_TAB: u16 = 0x30;
 
 /// macOS implementation: dispatch to the appropriate event helper.
@@ -89,7 +90,14 @@ pub(super) fn execute(action: &Action) {
         Action::NextDesktop => next_desktop(),
         Action::ShowDesktop => show_desktop(),
         Action::LaunchpadShow => launchpad(),
-        Action::SmartZoom => post_smart_magnify(),
+        // macOS exposes Smart Magnify only as an AppKit responder event, not
+        // as a public cross-application injection API. Use the documented,
+        // repeatable webpage zoom-in shortcut instead. This intentionally
+        // increments zoom on every press rather than toggling around a point.
+        Action::SmartZoom => {
+            let (key_code, flags) = smart_zoom_shortcut();
+            post_key(key_code, flags);
+        }
         // ── System ────────────────────────────────────────────────────────
         // Lock screen = Cmd+Ctrl+Q (kVK_ANSI_Q = 0x0C)
         Action::LockScreen => post_key(0x0C, cmd | ctrl),
@@ -285,36 +293,11 @@ fn post_media_key(nx_key: i32) {
     });
 }
 
-/// Post CoreGraphics' Smart Magnify gesture at the current pointer location.
-fn post_smart_magnify() {
-    use objc2_core_graphics::{CGEvent as RawCGEvent, CGEventTapLocation};
-
-    let Some(event) = new_smart_magnify_event() else {
-        tracing::warn!("CGEvent creation failed for Smart Magnify");
-        return;
-    };
-    RawCGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
-}
-
-/// Construct, position, and stamp a Smart Magnify event without posting it.
-fn new_smart_magnify_event() -> Option<impl std::ops::Deref<Target = objc2_core_graphics::CGEvent>>
-{
-    use objc2_core_graphics::{
-        CGEvent as RawCGEvent, CGEventField, CGEventSource as RawCGEventSource,
-        CGEventSourceStateID, CGEventType,
-    };
-
-    let source = RawCGEventSource::new(CGEventSourceStateID::HIDSystemState)?;
-    let event = RawCGEvent::new(Some(&source))?;
-    let cursor = RawCGEvent::location(Some(&event));
-    RawCGEvent::set_location(Some(&event), cursor);
-    RawCGEvent::set_type(Some(&event), CGEventType(super::smart_magnify_event_type()));
-    RawCGEvent::set_integer_value_field(
-        Some(&event),
-        CGEventField::EventSourceUserData,
-        super::SYNTHETIC_EVENT_USER_DATA,
-    );
-    Some(event)
+fn smart_zoom_shortcut() -> (u16, CGEventFlags) {
+    (
+        VK_EQUAL,
+        CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift,
+    )
 }
 
 /// Post a synthetic scroll event for `action` (one of the `Scroll*` variants).
@@ -624,14 +607,16 @@ mod symbolic_hotkey {
 
 #[cfg(test)]
 mod tests {
-    use super::new_smart_magnify_event;
-    use objc2_core_graphics::CGEvent;
+    use super::smart_zoom_shortcut;
+    use core_graphics::event::CGEventFlags;
 
     #[test]
-    fn smart_magnify_event_is_constructible_without_posting() {
-        let Some(event) = new_smart_magnify_event() else {
-            panic!("CoreGraphics must construct a Smart Magnify event");
-        };
-        assert_eq!(CGEvent::r#type(Some(&event)).0, 32);
+    fn smart_zoom_uses_repeatable_command_plus_shortcut() {
+        let (key_code, flags) = smart_zoom_shortcut();
+        assert_eq!(key_code, 0x18);
+        assert_eq!(
+            flags,
+            CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift
+        );
     }
 }
