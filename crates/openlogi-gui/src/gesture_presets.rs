@@ -19,6 +19,19 @@ pub(crate) enum GesturePreset {
     Custom,
 }
 
+/// Display/editor class of one button's complete binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompleteBindingClass {
+    /// One ordinary press action.
+    Single,
+    /// The exact canonical Window Navigation direction map.
+    WindowNavigation,
+    /// Continuous two-axis Pan with an editable click fallback.
+    Pan,
+    /// A directional map that does not exactly match Window Navigation.
+    Custom,
+}
+
 const MACOS_GESTURE_PRESETS: &[GesturePreset] = &[
     GesturePreset::WindowNavigation,
     GesturePreset::Pan,
@@ -47,6 +60,19 @@ pub(crate) fn classify_gesture_preset(binding: &Binding) -> GesturePreset {
         GesturePreset::Pan
     } else {
         GesturePreset::Custom
+    }
+}
+
+/// Classify one card from its own complete binding.
+#[must_use]
+pub(crate) fn classify_complete_binding(binding: &Binding) -> CompleteBindingClass {
+    match binding {
+        Binding::Single(_) => CompleteBindingClass::Single,
+        Binding::Pan(_) => CompleteBindingClass::Pan,
+        Binding::Gesture(_) if *binding == window_navigation_binding() => {
+            CompleteBindingClass::WindowNavigation
+        }
+        Binding::Gesture(_) => CompleteBindingClass::Custom,
     }
 }
 
@@ -104,7 +130,8 @@ pub(crate) fn binding_for_gesture_selection(
     current: &Binding,
     selected: GesturePreset,
 ) -> Option<Binding> {
-    (classify_gesture_preset(current) != selected).then(|| binding_for_gesture_preset(selected))
+    (matches!(current, Binding::Single(_)) || classify_gesture_preset(current) != selected)
+        .then(|| binding_for_gesture_preset(selected))
 }
 
 /// Return a complete directional binding with one edited direction.
@@ -125,6 +152,132 @@ pub(crate) fn gesture_binding_with_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_complete_bindings_independently() {
+        assert_eq!(
+            classify_complete_binding(&Binding::Single(Action::Copy)),
+            CompleteBindingClass::Single
+        );
+        assert_eq!(
+            classify_complete_binding(&window_navigation_binding()),
+            CompleteBindingClass::WindowNavigation
+        );
+        assert_eq!(
+            classify_complete_binding(&default_pan_binding()),
+            CompleteBindingClass::Pan
+        );
+        assert_eq!(
+            classify_complete_binding(&Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Left,
+                Action::Copy,
+            )]))),
+            CompleteBindingClass::Custom
+        );
+    }
+
+    #[test]
+    fn forward_pan_and_back_window_navigation_coexist() {
+        let mut config = Config::default();
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Forward,
+            default_pan_binding(),
+        );
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Back,
+            window_navigation_binding(),
+        );
+
+        let bindings = config.effective_bindings("mouse", None);
+        assert_eq!(
+            bindings.get(&ButtonId::Forward),
+            Some(&default_pan_binding())
+        );
+        assert_eq!(
+            bindings.get(&ButtonId::Back),
+            Some(&window_navigation_binding())
+        );
+    }
+
+    #[test]
+    fn replacing_back_does_not_mutate_forward() {
+        let mut config = Config::default();
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Forward,
+            default_pan_binding(),
+        );
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Back,
+            window_navigation_binding(),
+        );
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Back,
+            Binding::Single(Action::Copy),
+        );
+
+        let bindings = config.effective_bindings("mouse", None);
+        assert_eq!(
+            bindings.get(&ButtonId::Forward),
+            Some(&default_pan_binding())
+        );
+        assert_eq!(
+            bindings.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::Copy))
+        );
+    }
+
+    #[test]
+    fn per_app_replacement_changes_only_target_button() {
+        let mut config = Config::default();
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Forward,
+            default_pan_binding(),
+        );
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            None,
+            ButtonId::Back,
+            window_navigation_binding(),
+        );
+        apply_binding_to_scope(
+            &mut config,
+            "mouse",
+            Some("com.apple.Safari"),
+            ButtonId::Back,
+            Binding::Single(Action::Copy),
+        );
+
+        let global = config.effective_bindings("mouse", None);
+        let safari = config.effective_bindings("mouse", Some("com.apple.Safari"));
+        assert_eq!(
+            global.get(&ButtonId::Back),
+            Some(&window_navigation_binding())
+        );
+        assert_eq!(
+            safari.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::Copy))
+        );
+        assert_eq!(safari.get(&ButtonId::Forward), Some(&default_pan_binding()));
+    }
 
     #[test]
     fn recognizes_exact_presets_and_custom_bindings() {
@@ -263,5 +416,15 @@ mod tests {
             binding_for_gesture_selection(&current, GesturePreset::WindowNavigation),
             Some(window_navigation_binding())
         );
+    }
+
+    #[test]
+    fn selecting_custom_promotes_a_single_binding() {
+        let selected = binding_for_gesture_selection(
+            &Binding::Single(Action::MouseBack),
+            GesturePreset::Custom,
+        );
+
+        assert!(matches!(selected, Some(Binding::Gesture(_))));
     }
 }

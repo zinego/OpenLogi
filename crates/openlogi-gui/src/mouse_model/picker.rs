@@ -49,6 +49,7 @@ const POPOVER_LIST_MAX_H: f32 = 360.;
 /// dismisses the popover.
 pub fn action_picker<T: 'static>(
     btn: ButtonId,
+    gesture_capable: bool,
     observer: &Entity<T>,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
@@ -57,10 +58,11 @@ pub fn action_picker<T: 'static>(
         .and_then(|s| s.button_bindings.get(&btn).cloned());
 
     let observer = observer.clone();
+    let action_observer = observer.clone();
     let popover = cx.entity().downgrade();
     let on_pick: PickFn = Rc::new(move |action, window, cx| {
         cx.update_global::<AppState, _>(|state, _| state.commit_binding(btn, action));
-        observer.update(cx, |_, cx| cx.notify());
+        action_observer.update(cx, |_, cx| cx.notify());
         if let Some(p) = popover.upgrade() {
             p.update(cx, |s, cx| s.dismiss(window, cx));
         }
@@ -72,6 +74,10 @@ pub fn action_picker<T: 'static>(
         .min_w(px(POPOVER_W))
         .child(title(tr!("Bind %{name}", name => button), pal))
         .child(divider(pal))
+        .when(gesture_capable, |card| {
+            card.child(gesture_promotion_row(btn, &observer, pal, cx))
+                .child(divider(pal))
+        })
         .child(scroll_list(
             "picker-scroll",
             action_rows("action-item", current.as_ref(), &on_pick, pal),
@@ -89,6 +95,7 @@ const GESTURE_CELL_W: f32 = 104.;
 /// its action-list card beside the summary. Scratch selection lives on the
 /// [`MouseModelView`] and resets when the popover closes or its preset changes.
 pub fn gesture_overview(
+    button: ButtonId,
     view: &Entity<MouseModelView>,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
@@ -96,7 +103,7 @@ pub fn gesture_overview(
     let active = view.read(cx).gesture_selected_dir();
     let binding = cx
         .try_global::<AppState>()
-        .and_then(AppState::current_gesture_binding)
+        .and_then(|state| state.current_complete_binding(button))
         .unwrap_or_else(|| {
             Binding::Gesture(
                 GestureDirection::ALL
@@ -110,7 +117,7 @@ pub fn gesture_overview(
     v_flex()
         .items_start()
         .gap_2()
-        .child(preset_card(preset, view, pal))
+        .child(preset_card(button, preset, view, pal))
         .child(
             h_flex()
                 .items_start()
@@ -118,21 +125,27 @@ pub fn gesture_overview(
                 .child(if is_pan {
                     pan_card(&binding, view, active, pal)
                 } else {
-                    plus_card(view, active, pal, cx)
+                    plus_card(&binding, view, active, pal)
                 })
                 // The flyout card only appears once a direction is activated.
                 .when_some(active, |row, dir| {
                     row.child(if is_pan {
-                        pan_flyout_card(&binding, dir, view, pal, cx)
+                        pan_flyout_card(button, &binding, dir, view, pal, cx)
                     } else {
-                        flyout_card(dir, view, pal, cx)
+                        flyout_card(button, &binding, dir, view, pal)
                     })
                 }),
         )
+        .child(single_action_card(button, &binding, view, pal))
         .into_any_element()
 }
 
-fn preset_card(current: GesturePreset, view: &Entity<MouseModelView>, pal: Palette) -> AnyElement {
+fn preset_card(
+    button: ButtonId,
+    current: GesturePreset,
+    view: &Entity<MouseModelView>,
+    pal: Palette,
+) -> AnyElement {
     menu_card(pal)
         .gap_1p5()
         .child(title(tr!("Gesture preset"), pal))
@@ -141,13 +154,14 @@ fn preset_card(current: GesturePreset, view: &Entity<MouseModelView>, pal: Palet
                 available_gesture_presets(cfg!(target_os = "macos"))
                     .iter()
                     .copied()
-                    .map(|preset| preset_chip(preset, current, view, pal)),
+                    .map(|preset| preset_chip(button, preset, current, view, pal)),
             ),
         )
         .into_any_element()
 }
 
 fn preset_chip(
+    button: ButtonId,
     preset: GesturePreset,
     current: GesturePreset,
     view: &Entity<MouseModelView>,
@@ -183,7 +197,7 @@ fn preset_chip(
                     .cursor_pointer()
                     .on_click(move |_event, _window, cx| {
                         cx.update_global::<AppState, _>(|state, _| {
-                            state.commit_gesture_preset(preset);
+                            state.commit_gesture_preset(button, preset);
                         });
                         view.update(cx, |model, vcx| {
                             model.set_gesture_selected_dir(None);
@@ -261,6 +275,7 @@ fn pan_direction_cell(direction: GestureDirection, pal: Palette) -> AnyElement {
 }
 
 fn pan_flyout_card(
+    button: ButtonId,
     binding: &Binding,
     direction: GestureDirection,
     view: &Entity<MouseModelView>,
@@ -273,7 +288,7 @@ fn pan_flyout_card(
     let current = binding.click_action();
     let view_pick = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
-        cx.update_global::<AppState, _>(|state, _| state.commit_pan_click(action));
+        cx.update_global::<AppState, _>(|state, _| state.commit_pan_click(button, action));
         view_pick.update(cx, |_, vcx| vcx.notify());
     });
     menu_card(pal)
@@ -310,17 +325,17 @@ fn menu_card(pal: Palette) -> gpui::Div {
 /// action; the `active` cell (if any) is accented. Clicking a cell activates
 /// that direction (flying out the level-2 card) without committing.
 fn plus_card(
+    binding: &Binding,
     view: &Entity<MouseModelView>,
     active: Option<GestureDirection>,
     pal: Palette,
-    cx: &mut Context<PopoverState>,
 ) -> AnyElement {
     let actions: BTreeMap<GestureDirection, Action> = GestureDirection::ALL
         .into_iter()
         .map(|d| {
-            let action = cx
-                .try_global::<AppState>()
-                .and_then(|s| s.gesture_bindings.get(&d).cloned())
+            let action = binding
+                .direction_action(d)
+                .cloned()
                 .unwrap_or_else(|| default_gesture_binding(d));
             (d, action)
         })
@@ -419,19 +434,22 @@ fn direction_cell(
 /// commits and stays open, so the level-1 cell + checkmark update in place and
 /// the user can keep editing other directions.
 fn flyout_card(
+    button: ButtonId,
+    binding: &Binding,
     dir: GestureDirection,
     view: &Entity<MouseModelView>,
     pal: Palette,
-    cx: &mut Context<PopoverState>,
 ) -> AnyElement {
-    let current = cx
-        .try_global::<AppState>()
-        .and_then(|s| s.gesture_bindings.get(&dir).cloned())
+    let current = binding
+        .direction_action(dir)
+        .cloned()
         .unwrap_or_else(|| default_gesture_binding(dir));
 
     let view_pick = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
-        cx.update_global::<AppState, _>(|state, _| state.commit_gesture_binding(dir, action));
+        cx.update_global::<AppState, _>(|state, _| {
+            state.commit_gesture_binding(button, dir, action);
+        });
         // Stay open; re-render so the level-1 cell + checkmark update.
         view_pick.update(cx, |_, vcx| vcx.notify());
     });
@@ -443,6 +461,82 @@ fn flyout_card(
         .child(scroll_list(
             "gesture-dir-scroll",
             action_rows("gesture-action", Some(&current), &on_pick, pal),
+        ))
+        .into_any_element()
+}
+
+fn gesture_promotion_row<T: 'static>(
+    button: ButtonId,
+    observer: &Entity<T>,
+    pal: Palette,
+    cx: &mut Context<PopoverState>,
+) -> AnyElement {
+    let popover = cx.entity().downgrade();
+    h_flex()
+        .gap_1p5()
+        .children(
+            available_gesture_presets(cfg!(target_os = "macos"))
+                .iter()
+                .copied()
+                .map(|preset| {
+                    let observer = observer.clone();
+                    let popover = popover.clone();
+                    let (id, label) = match preset {
+                        GesturePreset::WindowNavigation => (0usize, tr!("Window Navigation")),
+                        GesturePreset::Pan => (1, tr!("Pan")),
+                        GesturePreset::Custom => (2, tr!("Custom")),
+                    };
+                    div()
+                        .id(("gesture-promotion", id))
+                        .role(Role::Button)
+                        .aria_label(label.clone())
+                        .px_2()
+                        .py_1()
+                        .rounded(pal.control_radius)
+                        .text_caption()
+                        .text_color(pal.text_muted)
+                        .hover(move |style| style.bg(pal.surface_hover))
+                        .cursor_pointer()
+                        .child(label)
+                        .on_click(move |_event, window, cx| {
+                            cx.update_global::<AppState, _>(|state, _| {
+                                state.commit_gesture_preset(button, preset);
+                            });
+                            observer.update(cx, |_, cx| cx.notify());
+                            if let Some(popover) = popover.upgrade() {
+                                popover.update(cx, |state, cx| state.dismiss(window, cx));
+                            }
+                        })
+                }),
+        )
+        .into_any_element()
+}
+
+fn single_action_card(
+    button: ButtonId,
+    binding: &Binding,
+    view: &Entity<MouseModelView>,
+    pal: Palette,
+) -> AnyElement {
+    let current = binding.click_action();
+    let view = view.clone();
+    let on_pick: PickFn = Rc::new(move |action, _window, cx| {
+        cx.update_global::<AppState, _>(|state, _| state.commit_binding(button, action));
+        view.update(cx, |model, cx| {
+            model.set_gesture_selected_dir(None);
+            cx.notify();
+        });
+    });
+    menu_card(pal)
+        .min_w(px(POPOVER_W))
+        .child(title(
+            tr!("Bind %{name}", name => rust_i18n::t!(button.label())),
+            pal,
+        ))
+        .child(divider(pal))
+        .child(scroll_list(
+            "single-action-scroll",
+            action_rows("single-action-item", Some(&current), &on_pick, pal),
         ))
         .into_any_element()
 }
@@ -493,7 +587,7 @@ pub(crate) fn action_icon_path(action: &Action) -> &'static str {
         Action::Undo => "action-icons/undo-2.svg",
         Action::Redo => "action-icons/redo-2.svg",
         Action::SelectAll => "action-icons/list-checks.svg",
-        Action::Find => "action-icons/search.svg",
+        Action::Find | Action::SmartZoom => "action-icons/search.svg",
         Action::Save => "action-icons/save.svg",
         Action::BrowserBack => "action-icons/arrow-left.svg",
         Action::BrowserForward => "action-icons/arrow-right.svg",
@@ -509,7 +603,6 @@ pub(crate) fn action_icon_path(action: &Action) -> &'static str {
         Action::NextDesktop => "action-icons/square-arrow-right.svg",
         Action::ShowDesktop => "action-icons/monitor.svg",
         Action::LaunchpadShow => "action-icons/grid-3x3.svg",
-        Action::SmartZoom => "action-icons/search.svg",
         Action::LockScreen => "action-icons/lock.svg",
         Action::Screenshot | Action::CaptureRegion => "action-icons/camera.svg",
         Action::PlayPause => "action-icons/play.svg",

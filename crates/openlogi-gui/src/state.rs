@@ -47,7 +47,7 @@ pub enum SmartShiftWriteStatus {
 use load::LazyDeviceData;
 
 use crate::asset::AssetResolver;
-use crate::data::mouse_buttons::{Action, Binding, ButtonId, GestureDirection};
+use crate::data::mouse_buttons::{Action, Binding, ButtonId, GestureDirection, default_binding};
 use crate::gesture_presets::{
     GesturePreset, apply_binding_to_scope, binding_for_gesture_selection,
     gesture_binding_with_direction, pan_binding_with_click,
@@ -113,14 +113,10 @@ pub struct AppState {
     /// Bindings for the *currently selected* device. Reloaded whenever the
     /// carousel selection changes.
     pub button_bindings: BTreeMap<ButtonId, Action>,
-    /// Per-direction sub-bindings for the current device's gesture owner. Edited
-    /// via the gesture picker and persisted as a [`Binding::Gesture`] entry under
-    /// the owning button — the HID++ gesture button ([`ButtonId::GestureButton`]) by default,
-    /// or a promoted Middle/Back/Forward — in the device's unified binding map
-    /// ([`DeviceConfig::bindings`]). Rebuilt by the `gesture_bindings_for_current` helper.
-    ///
-    /// [`DeviceConfig::bindings`]: openlogi_core::config::DeviceConfig::bindings
-    pub gesture_bindings: BTreeMap<GestureDirection, Action>,
+    /// Complete effective gesture/Pan bindings keyed by their own button.
+    /// Retained as summary state for the details panel; editors always query
+    /// [`Self::current_complete_binding`] with an explicit button.
+    pub gesture_bindings: BTreeMap<ButtonId, Binding>,
     pub dpi: u32,
     /// DPI capability load state keyed by [`DeviceRecord::config_key`]. Loaded
     /// lazily because HID++ reads must not block device switching or rendering.
@@ -1327,23 +1323,7 @@ impl AppState {
     /// of bubbling up: the UI thread shouldn't crash because the user's
     /// home volume is full or because the hook thread panicked.
     pub fn commit_binding(&mut self, button: ButtonId, action: Action) {
-        self.button_bindings.insert(button, action.clone());
-
-        let Some(key) = self
-            .current_record()
-            .and_then(DeviceRecord::persistent_config_key)
-            .map(str::to_string)
-        else {
-            debug!(
-                ?button,
-                "no persistent device key — binding kept in memory only"
-            );
-            return;
-        };
-        self.config
-            .set_binding(&key, button, Binding::Single(action));
-        // The agent owns the hook; have it rebuild its live map from config.
-        self.persist_and_reload("binding");
+        self.commit_complete_binding(button, Binding::Single(action));
     }
 
     fn bindings_for_current(&self) -> BTreeMap<ButtonId, Action> {
@@ -1355,130 +1335,108 @@ impl AppState {
         )
     }
 
-    /// The effective complete binding for the current gesture owner, including
-    /// the foreground application's whole-binding override.
-    #[must_use]
-    pub(crate) fn current_gesture_binding(&self) -> Option<Binding> {
+    fn gesture_bindings_for_current(&self) -> BTreeMap<ButtonId, Binding> {
         let Some(key) = self
             .current_record()
             .and_then(DeviceRecord::persistent_config_key)
         else {
-            return None;
-        };
-        let owner = self.config.gesture_owner(key)?;
-        self.config
-            .effective_bindings(key, self.current_app_bundle.as_deref())
-            .remove(&owner)
-            .or_else(|| {
-                (owner == ButtonId::GestureButton)
-                    .then(|| openlogi_core::binding::default_binding_for(owner))
-            })
-    }
-
-    fn gesture_bindings_for_current(&self) -> BTreeMap<GestureDirection, Action> {
-        let Some(mut binding) = self.current_gesture_binding() else {
             return BTreeMap::new();
         };
-        binding.fill_gesture_defaults();
-        match binding {
-            Binding::Gesture(map) => map,
-            Binding::Single(_) | Binding::Pan(_) => BTreeMap::new(),
-        }
+        self.config
+            .effective_bindings(key, self.current_app_bundle.as_deref())
+            .into_iter()
+            .filter(|(_, binding)| !matches!(binding, Binding::Single(_)))
+            .collect()
     }
 
-    /// The current device's gesture button — the [`Binding::Gesture`] owner — or
-    /// `None` when no button is in gesture mode. Drives which button's card opens
-    /// the gesture menu rather than the single-action picker.
+    /// The effective complete binding for `button`, including the foreground
+    /// application's whole-binding override.
     #[must_use]
-    pub fn current_gesture_owner(&self) -> Option<ButtonId> {
+    pub(crate) fn current_complete_binding(&self, button: ButtonId) -> Option<Binding> {
         let key = self.current_record()?.persistent_config_key()?;
-        self.config.gesture_owner(key)
+        Some(
+            self.config
+                .effective_bindings(key, self.current_app_bundle.as_deref())
+                .remove(&button)
+                .unwrap_or_else(|| {
+                    if button == ButtonId::GestureButton {
+                        openlogi_core::binding::default_binding_for(button)
+                    } else {
+                        Binding::Single(default_binding(button))
+                    }
+                }),
+        )
     }
 
-    /// Make `button` the current device's gesture button (or clear it with
-    /// `None`), enforcing the one-gesture-button-per-device lock. Persists, tells
-    /// the agent to rebuild, and refreshes the projected maps the UI reads.
-    pub fn commit_gesture_owner(&mut self, button: Option<ButtonId>) {
-        let Some(key) = self
-            .current_record()
-            .and_then(DeviceRecord::persistent_config_key)
-            .map(str::to_string)
-        else {
-            return;
-        };
-        match button {
-            Some(b) => {
-                self.config.set_gesture_owner(&key, b);
-            }
-            None => {
-                self.config.disable_gestures(&key);
-            }
-        }
-        // The owner change shuffles bindings between the single + gesture maps.
-        self.button_bindings = self.bindings_for_current();
-        self.gesture_bindings = self.gesture_bindings_for_current();
-        self.persist_and_reload("gesture-button change");
-    }
-
-    /// Atomically replace the current gesture owner's complete binding in the
+    /// Atomically replace one button's complete binding in the
     /// global or foreground-application scope, then persist and reload once.
-    fn commit_complete_gesture_binding(&mut self, binding: Binding) {
+    pub(crate) fn commit_complete_binding(&mut self, button: ButtonId, binding: Binding) {
         let Some(key) = self
             .current_record()
             .and_then(DeviceRecord::persistent_config_key)
             .map(str::to_string)
         else {
-            return;
-        };
-        let Some(owner) = self.config.gesture_owner(&key) else {
+            if let Binding::Single(action) = binding {
+                self.button_bindings.insert(button, action);
+            }
+            debug!(
+                ?button,
+                "no persistent device key — binding kept in memory only"
+            );
             return;
         };
         apply_binding_to_scope(
             &mut self.config,
             &key,
             self.current_app_bundle.as_deref(),
-            owner,
+            button,
             binding,
         );
         self.button_bindings = self.bindings_for_current();
         self.gesture_bindings = self.gesture_bindings_for_current();
-        self.persist_and_reload("gesture binding");
+        self.persist_and_reload("button binding");
     }
 
     /// Apply a whole gesture preset without exposing per-direction intermediate
     /// states to the agent or writing the config more than once.
-    pub(crate) fn commit_gesture_preset(&mut self, preset: GesturePreset) {
-        let Some(current) = self.current_gesture_binding() else {
+    pub(crate) fn commit_gesture_preset(&mut self, button: ButtonId, preset: GesturePreset) {
+        let Some(current) = self.current_complete_binding(button) else {
             return;
         };
         let Some(binding) = binding_for_gesture_selection(&current, preset) else {
             return;
         };
-        self.commit_complete_gesture_binding(binding);
+        self.commit_complete_binding(button, binding);
     }
 
     /// Update the click fallback of the current Pan binding as one complete
     /// binding replacement. A stale callback after leaving Pan is a no-op.
-    pub(crate) fn commit_pan_click(&mut self, action: Action) {
-        let Some(binding) = self.current_gesture_binding() else {
+    pub(crate) fn commit_pan_click(&mut self, button: ButtonId, action: Action) {
+        let Some(binding) = self.current_complete_binding(button) else {
             return;
         };
         if !binding.is_pan() {
             return;
         }
-        self.commit_complete_gesture_binding(pan_binding_with_click(&binding, action));
+        self.commit_complete_binding(button, pan_binding_with_click(&binding, action));
     }
 
     /// Update a single gesture-button sub-binding in memory, on disk, and in the
     /// shared gesture map the watcher thread reads.
-    pub fn commit_gesture_binding(&mut self, direction: GestureDirection, action: Action) {
-        let Some(current) = self.current_gesture_binding() else {
+    pub fn commit_gesture_binding(
+        &mut self,
+        button: ButtonId,
+        direction: GestureDirection,
+        action: Action,
+    ) {
+        let Some(current) = self.current_complete_binding(button) else {
             debug!(?direction, "no active gesture binding — edit ignored");
             return;
         };
-        self.commit_complete_gesture_binding(gesture_binding_with_direction(
-            &current, direction, action,
-        ));
+        self.commit_complete_binding(
+            button,
+            gesture_binding_with_direction(&current, direction, action),
+        );
     }
 }
 
