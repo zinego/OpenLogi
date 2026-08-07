@@ -76,11 +76,10 @@ pub struct DeviceConfig {
     /// Per-application binding overlays (P1.4). Keyed by bundle identifier
     /// (e.g. `"com.microsoft.VSCode"` on macOS). When the foreground app's
     /// id matches a key here, those bindings take precedence; anything not
-    /// listed falls through to `bindings`. Deliberately `Action`-valued (not
-    /// `Binding`): a per-app override replaces the whole button with one
-    /// action, never a per-direction gesture overlay.
+    /// listed falls through to `bindings`. Legacy action values deserialize as
+    /// [`Binding::Single`], preserving their original TOML representation.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
+    pub per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Binding>>,
     /// Ordered list of DPI presets cycled through by
     /// [`Action::CycleDpiPresets`] and indexed by
     /// [`Action::SetDpiPreset`]. Empty means "no presets configured" —
@@ -150,7 +149,7 @@ struct RawDeviceConfig {
     #[serde(default)]
     gesture_bindings: BTreeMap<GestureDirection, Action>,
     #[serde(default)]
-    per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Action>>,
+    per_app_bindings: BTreeMap<String, BTreeMap<ButtonId, Binding>>,
     #[serde(default)]
     dpi_presets: Vec<u32>,
     #[serde(default)]

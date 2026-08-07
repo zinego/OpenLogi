@@ -354,7 +354,7 @@ impl Config {
     /// Resolve the effective binding map for `device_key`, overlaying the
     /// per-app entry for `bundle_id` (if any) on top of the global per-device
     /// `bindings`. A per-app override replaces the whole button with a
-    /// [`Binding::Single`]; everything else falls through.
+    /// [`Binding`]; everything else falls through.
     ///
     /// Returns an empty map when the device has no recorded bindings yet.
     /// Callers (the GUI / hook) layer their own defaults on top.
@@ -372,21 +372,21 @@ impl Config {
             && let Some(overlay) = device.per_app_bindings.get(bid)
         {
             for (k, v) in overlay {
-                out.insert(*k, Binding::Single(v.clone()));
+                out.insert(*k, v.clone());
             }
         }
         out
     }
 
     /// Records a per-app override. Creates the device + app entries as
-    /// needed; passing an action of `None` removes the override and prunes
+    /// needed; passing a binding of `None` removes the override and prunes
     /// the empty app map.
     pub fn set_per_app_binding(
         &mut self,
         device_key: &str,
         bundle_id: &str,
         button: ButtonId,
-        action: Option<Action>,
+        binding: Option<Binding>,
     ) {
         let entry = self
             .devices
@@ -395,9 +395,9 @@ impl Config {
             .per_app_bindings
             .entry(bundle_id.to_string())
             .or_default();
-        match action {
-            Some(a) => {
-                entry.insert(button, a);
+        match binding {
+            Some(binding) => {
+                entry.insert(button, binding);
             }
             None => {
                 entry.remove(&button);
@@ -945,7 +945,7 @@ mod tests {
             "2b042",
             "com.microsoft.VSCode",
             ButtonId::Back,
-            Some(Action::Undo),
+            Some(Binding::Single(Action::Undo)),
         );
 
         // Global: both buttons are browser nav.
@@ -979,13 +979,49 @@ mod tests {
     }
 
     #[test]
+    fn per_app_pan_overlay_roundtrips_as_a_binding() {
+        let mut cfg = Config::default();
+        cfg.set_per_app_binding(
+            "mouse",
+            "com.apple.Safari",
+            ButtonId::Back,
+            Some(crate::binding::default_pan_binding()),
+        );
+
+        let restored = write_and_read(&cfg);
+        assert_eq!(
+            restored.effective_bindings("mouse", Some("com.apple.Safari"))[&ButtonId::Back],
+            crate::binding::default_pan_binding()
+        );
+    }
+
+    #[test]
+    fn legacy_per_app_action_loads_as_single_binding() {
+        let cfg: Config = toml::from_str(
+            r#"
+                schema_version = 3
+                [devices.mouse.per_app_bindings."com.apple.Safari"]
+                Back = "BrowserBack"
+            "#,
+        )
+        .expect("legacy per-app action loads");
+
+        assert_eq!(
+            cfg.devices["mouse"].per_app_bindings["com.apple.Safari"][&ButtonId::Back],
+            Binding::Single(Action::BrowserBack)
+        );
+        let body = toml::to_string_pretty(&cfg).expect("serialize");
+        assert!(body.contains("Back = \"BrowserBack\""));
+    }
+
+    #[test]
     fn per_app_binding_removal_prunes_empty_app() {
         let mut cfg = Config::default();
         cfg.set_per_app_binding(
             "2b042",
             "com.example.App",
             ButtonId::Back,
-            Some(Action::Copy),
+            Some(Binding::Single(Action::Copy)),
         );
         cfg.set_per_app_binding("2b042", "com.example.App", ButtonId::Back, None);
         assert!(

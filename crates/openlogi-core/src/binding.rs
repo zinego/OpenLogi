@@ -11,8 +11,10 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+mod pan;
 mod swipe;
 
+pub use pan::{PAN_DEADZONE, PanAccumulator, PanOutput};
 pub use swipe::{
     GESTURE_HOLD_FOR_SWIPE, GESTURE_SWIPE_DEADZONE, GESTURE_SWIPE_THRESHOLD, SwipeAccumulator,
     detect_swipe,
@@ -363,6 +365,10 @@ pub enum Action {
     /// The `display` field is used by [`Action::label`] so the popover
     /// shows the user-friendly chord name.
     CustomShortcut(KeyCombo),
+
+    /// macOS Smart Zoom / Smart Magnify at the current pointer location.
+    /// Appended to preserve existing enum discriminants on the IPC wire.
+    SmartZoom,
 }
 
 /// A modifier + virtual-key keystroke captured by the P1.3 recorder UI or
@@ -451,30 +457,52 @@ impl KeyCombo {
     }
 }
 
-/// What a single rebindable [`ButtonId`] does: either one [`Action`], or — for a
-/// raw-XY-capable button placed in gesture mode — a per-[`GestureDirection`]
-/// map (hold + swipe up/down/left/right, or a plain click).
+/// Configuration carried by a continuous [`Binding::Pan`] lifecycle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanBinding {
+    /// Action fired when the button is released before Pan leaves its movement
+    /// deadzone. An activated Pan ends without firing this fallback.
+    pub click: Action,
+}
+
+mod pan_binding_envelope {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::PanBinding;
+
+    #[derive(Serialize)]
+    struct EnvelopeRef<'a> {
+        #[serde(rename = "Pan")]
+        pan: &'a PanBinding,
+    }
+
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(rename = "Pan")]
+        pan: PanBinding,
+    }
+
+    pub(super) fn serialize<S>(binding: &PanBinding, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        EnvelopeRef { pan: binding }.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<PanBinding, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Envelope::deserialize(deserializer).map(|envelope| envelope.pan)
+    }
+}
+
+/// What a single rebindable [`ButtonId`] does: one action, a directional
+/// gesture map, or a continuous Pan lifecycle.
 ///
-/// There has only ever been one binding map per device; a gesture binding is
-/// just a binding whose payload is a direction map instead of a single action.
-///
-/// # Serialization
-///
-/// `#[serde(untagged)]`: [`Single`](Binding::Single) serializes exactly as the
-/// bare [`Action`] did before (a string `"BrowserBack"`, or a single-key table
-/// for the payload variants), and [`Gesture`](Binding::Gesture) serializes as a
-/// table keyed by [`GestureDirection`] names (`Up`/`Down`/`Left`/`Right`/
-/// `Click`).
-///
-/// The two arms are disambiguated by the **zero overlap** between [`Action`]
-/// variant names and [`GestureDirection`] variant names — untagged tries
-/// `Single(Action)` first, and a table keyed by `Up` etc. cannot parse as an
-/// externally-tagged `Action`, so it falls through to `Gesture`. A payload
-/// action like `{ SetDpiPreset = 2 }` is a valid externally-tagged `Action`, so
-/// it stays `Single` and never reaches the `Gesture` arm. This invariant is the
-/// entire safety basis for untagged routing; the `binding_untagged_*` tests
-/// guard it (a future `Action` named `Up`/`Down`/`Left`/`Right`/`Click` would
-/// silently mis-route, and those tests would fail).
+/// `Single` and `Gesture` retain their historical untagged TOML shapes. `Pan`
+/// uses an explicit `Pan` envelope, keeping it disjoint from both an externally
+/// tagged payload [`Action`] and a direction-keyed gesture map.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Binding {
@@ -484,6 +512,10 @@ pub enum Binding {
     /// committed swipe direction, with [`GestureDirection::Click`] holding the
     /// plain-click (no-swipe) action.
     Gesture(BTreeMap<GestureDirection, Action>),
+    /// Continuous two-axis content movement while held, with an explicit click
+    /// fallback. The serde field adapter preserves the unambiguous
+    /// `{ Pan = { click = ... } }` envelope.
+    Pan(#[serde(with = "pan_binding_envelope")] PanBinding),
 }
 
 impl Binding {
@@ -501,6 +533,7 @@ impl Binding {
                 .get(&GestureDirection::Click)
                 .cloned()
                 .unwrap_or(Action::None),
+            Binding::Pan(pan) => pan.click.clone(),
         }
     }
 
@@ -509,7 +542,7 @@ impl Binding {
     #[must_use]
     pub fn direction_action(&self, direction: GestureDirection) -> Option<&Action> {
         match self {
-            Binding::Single(_) => None,
+            Binding::Single(_) | Binding::Pan(_) => None,
             Binding::Gesture(map) => map.get(&direction),
         }
     }
@@ -519,6 +552,12 @@ impl Binding {
     #[must_use]
     pub fn is_gesture(&self) -> bool {
         matches!(self, Binding::Gesture(_))
+    }
+
+    /// Whether this binding captures a hold as continuous two-axis Pan motion.
+    #[must_use]
+    pub fn is_pan(&self) -> bool {
+        matches!(self, Binding::Pan(_))
     }
 
     /// Promote a [`Single`](Binding::Single) binding in place to a
@@ -609,6 +648,7 @@ impl Action {
             Action::HorizontalScrollLeft => "Scroll Left".into(),
             Action::HorizontalScrollRight => "Scroll Right".into(),
             Action::CustomShortcut(combo) => combo.rendered_label(),
+            Action::SmartZoom => "Smart Zoom".into(),
         }
     }
 
@@ -645,7 +685,8 @@ impl Action {
             | Action::PreviousDesktop
             | Action::NextDesktop
             | Action::ShowDesktop
-            | Action::LaunchpadShow => Category::Navigation,
+            | Action::LaunchpadShow
+            | Action::SmartZoom => Category::Navigation,
             Action::None | Action::LockScreen | Action::Screenshot | Action::CaptureRegion => {
                 Category::System
             }
@@ -703,6 +744,7 @@ impl Action {
             Action::NextDesktop,
             Action::ShowDesktop,
             Action::LaunchpadShow,
+            Action::SmartZoom,
             // System
             Action::None,
             Action::LockScreen,
@@ -773,6 +815,28 @@ pub fn default_gesture_binding(direction: GestureDirection) -> Action {
         GestureDirection::Right => Action::NextTab,
         GestureDirection::Click => Action::AppExpose,
     }
+}
+
+/// The exact five-direction Window Navigation preset observed in Logi
+/// Options+ on macOS.
+#[must_use]
+pub fn window_navigation_binding() -> Binding {
+    Binding::Gesture(BTreeMap::from([
+        (GestureDirection::Left, Action::PreviousDesktop),
+        (GestureDirection::Right, Action::NextDesktop),
+        (GestureDirection::Up, Action::MissionControl),
+        (GestureDirection::Down, Action::AppExpose),
+        (GestureDirection::Click, Action::MissionControl),
+    ]))
+}
+
+/// The canonical continuous Pan binding, whose no-motion click performs macOS
+/// Smart Zoom.
+#[must_use]
+pub fn default_pan_binding() -> Binding {
+    Binding::Pan(PanBinding {
+        click: Action::SmartZoom,
+    })
 }
 
 /// The canonical default [`Binding`] for a fresh button in the merged model.
@@ -949,6 +1013,64 @@ mod tests {
         assert_eq!(Action::CaptureRegion.label(), "Capture Region");
         assert_eq!(Action::CaptureRegion.category(), Category::System);
         assert!(Action::catalog().contains(&Action::CaptureRegion));
+    }
+
+    #[test]
+    fn pan_binding_has_an_unambiguous_tagged_toml_shape() {
+        let mut bindings = BTreeMap::new();
+        bindings.insert(ButtonId::Back, default_pan_binding());
+
+        let encoded = toml::to_string_pretty(&BindingWrapper { bindings }).expect("serialize");
+        assert_eq!(encoded, "[bindings.Back.Pan]\nclick = \"SmartZoom\"\n");
+
+        let decoded = toml::from_str::<BindingWrapper>(&encoded).expect("deserialize");
+        assert_eq!(decoded.bindings[&ButtonId::Back], default_pan_binding());
+    }
+
+    #[test]
+    fn existing_binding_toml_shapes_remain_stable() {
+        let single = toml::from_str::<BindingWrapper>("bindings.Back = \"BrowserBack\"")
+            .expect("deserialize single");
+        assert_eq!(
+            toml::to_string_pretty(&single).expect("serialize single"),
+            "[bindings]\nBack = \"BrowserBack\"\n"
+        );
+
+        let gesture = toml::from_str::<BindingWrapper>(
+            "[bindings.GestureButton]\nUp = \"MissionControl\"\nClick = \"AppExpose\"\n",
+        )
+        .expect("deserialize gesture");
+        assert_eq!(
+            toml::to_string_pretty(&gesture).expect("serialize gesture"),
+            "[bindings.GestureButton]\nUp = \"MissionControl\"\nClick = \"AppExpose\"\n"
+        );
+    }
+
+    #[test]
+    fn window_navigation_preset_matches_options_plus() {
+        let binding = window_navigation_binding();
+        assert_eq!(
+            binding.direction_action(GestureDirection::Left),
+            Some(&Action::PreviousDesktop)
+        );
+        assert_eq!(
+            binding.direction_action(GestureDirection::Right),
+            Some(&Action::NextDesktop)
+        );
+        assert_eq!(
+            binding.direction_action(GestureDirection::Up),
+            Some(&Action::MissionControl)
+        );
+        assert_eq!(
+            binding.direction_action(GestureDirection::Down),
+            Some(&Action::AppExpose)
+        );
+        assert_eq!(binding.click_action(), Action::MissionControl);
+    }
+
+    #[test]
+    fn default_pan_click_is_smart_zoom() {
+        assert_eq!(default_pan_binding().click_action(), Action::SmartZoom);
     }
 
     // ── TOML roundtrip ────────────────────────────────────────────────────────
