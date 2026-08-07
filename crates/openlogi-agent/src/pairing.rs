@@ -272,6 +272,7 @@ mod tests {
             thumbwheel_sensitivity: Arc::new(0.into()),
             capture_channel: Arc::new(RwLock::new(None)),
             pan_emitter: openlogi_agent_core::hook_runtime::PanEmitter::new(),
+            capture_epoch: Arc::new(0.into()),
             receiver_access: ReceiverAccess::default(),
         }
     }

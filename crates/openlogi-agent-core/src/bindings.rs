@@ -122,8 +122,9 @@ pub fn hid_gesture_for(
 /// this returns the owner's raw stored map. In practice that map is already
 /// fully populated — [`Config::set_gesture_owner`] seeds all five directions via
 /// [`Binding::fill_gesture_defaults`] when a button is promoted — so only a
-/// hand-edited sparse map leaves a direction unbound, in which case that swipe
-/// simply does nothing. The dedicated gesture button is intentionally excluded:
+/// hand-edited sparse map leaves a direction unbound, in which case the OS-hook
+/// runtime uses the map's click action (or the button's native default when Click
+/// is also absent) as its fallback. The dedicated gesture button is intentionally excluded:
 /// it never reaches the OS hook (it's captured over HID++), so it has no entry
 /// here.
 ///

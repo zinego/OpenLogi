@@ -46,6 +46,32 @@ pub struct HookMaps {
 /// (orchestrator), the OS-hook callback, and the gesture watcher.
 pub type SharedHookMaps = Arc<RwLock<HookMaps>>;
 
+const ACTION_QUEUE_CAPACITY: usize = 64;
+
+/// Bounded, non-blocking action sink for the freeze-sensitive OS-hook callback.
+#[derive(Clone)]
+struct ActionEmitter {
+    queue: SyncSender<Action>,
+}
+
+impl ActionEmitter {
+    fn new(dpi_cycle: Arc<RwLock<DpiCycleState>>, capture: CaptureChannel) -> Self {
+        let (queue, receiver) = sync_channel(ACTION_QUEUE_CAPACITY);
+        thread::spawn(move || {
+            while let Ok(action) = receiver.recv() {
+                dispatch_action(&action, &dpi_cycle, &capture);
+            }
+        });
+        Self { queue }
+    }
+
+    /// Queue one action without waiting for capacity. Saturation or worker exit
+    /// drops the action so an event tap can never stall behind injection or I/O.
+    fn emit(&self, action: Action) -> bool {
+        self.queue.try_send(action).is_ok()
+    }
+}
+
 /// Tracks which OS-hook button (Middle/Back/Forward) is mid-hold and defers the
 /// swipe detection itself to a shared [`SwipeAccumulator`], which commits a swipe
 /// *mid-motion* like the HID++ gesture-button path in `openlogi-hid`. This wrapper
@@ -336,8 +362,7 @@ pub fn start(
 
     let context = HookContext {
         hooks,
-        dpi_cycle,
-        capture,
+        action_emitter: ActionEmitter::new(dpi_cycle, capture),
         monitor,
         pan_emitter,
     };
@@ -359,8 +384,7 @@ pub fn start(
 
 struct HookContext {
     hooks: SharedHookMaps,
-    dpi_cycle: Arc<RwLock<DpiCycleState>>,
-    capture: CaptureChannel,
+    action_emitter: ActionEmitter,
     monitor: SharedEventMonitor,
     pan_emitter: PanEmitter,
 }
@@ -382,39 +406,41 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
     if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
     }
+    let Ok(maps) = context.hooks.try_read() else {
+        let active = HOLD.with_borrow(|hold| hold.active_button() == Some(id));
+        if active {
+            let _ = HOLD.with_borrow_mut(HoldState::cancel);
+        }
+        return if active && !pressed {
+            EventDisposition::Suppress
+        } else {
+            EventDisposition::PassThrough
+        };
+    };
+    let generation = maps.generation;
+    let gesture = maps.gestures.get(&id).cloned();
+    let action = maps.bindings.get(&id).cloned();
+    drop(maps);
+
     if pressed {
-        let gesture = context.hooks.read().ok().and_then(|maps| {
-            maps.gestures
-                .get(&id)
-                .cloned()
-                .map(|mode| (maps.generation, mode))
-        });
-        if let Some((generation, gesture)) = gesture {
+        if let Some(gesture) = gesture {
             HOLD.with_borrow_mut(|hold| hold.begin(id, gesture, generation));
             return EventDisposition::Suppress;
         }
     } else {
-        let (generation, current) = context.hooks.read().ok().map_or((0, None), |maps| {
-            (maps.generation, maps.gestures.get(&id).cloned())
-        });
-        let matches = HOLD.with_borrow(|hold| hold.mode_matches(id, current.as_ref(), generation));
+        let matches = HOLD.with_borrow(|hold| hold.mode_matches(id, gesture.as_ref(), generation));
         if !matches && HOLD.with_borrow(|hold| hold.active_button() == Some(id)) {
             let _ = HOLD.with_borrow_mut(HoldState::cancel);
             return EventDisposition::Suppress;
         }
         if let Some(output) = HOLD.with_borrow_mut(|hold| hold.end(id)) {
             if let HoldOutput::Action(action) = output {
-                dispatch_action(&action, &context.dpi_cycle, &context.capture);
+                let _ = context.action_emitter.emit(action);
             }
             return EventDisposition::Suppress;
         }
     }
 
-    let action = context
-        .hooks
-        .read()
-        .ok()
-        .and_then(|maps| maps.bindings.get(&id).cloned());
     let Some(action) = action else {
         return EventDisposition::PassThrough;
     };
@@ -423,7 +449,7 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
     }
     if pressed {
         info!(button = %id, action = %action.label(), "button → executing bound action");
-        dispatch_action(&action, &context.dpi_cycle, &context.capture);
+        let _ = context.action_emitter.emit(action);
     }
     EventDisposition::Suppress
 }
@@ -432,9 +458,12 @@ fn handle_motion(context: &HookContext, delta_x: i32, delta_y: i32) -> EventDisp
     let Some(button) = HOLD.with_borrow(HoldState::active_button) else {
         return EventDisposition::PassThrough;
     };
-    let (generation, current) = context.hooks.read().ok().map_or((0, None), |maps| {
-        (maps.generation, maps.gestures.get(&button).cloned())
-    });
+    let Ok(maps) = context.hooks.try_read() else {
+        let _ = HOLD.with_borrow_mut(HoldState::cancel);
+        return EventDisposition::PassThrough;
+    };
+    let (generation, current) = (maps.generation, maps.gestures.get(&button).cloned());
+    drop(maps);
     if !HOLD.with_borrow(|hold| hold.mode_matches(button, current.as_ref(), generation)) {
         let _ = HOLD.with_borrow_mut(HoldState::cancel);
         return EventDisposition::PassThrough;
@@ -442,7 +471,7 @@ fn handle_motion(context: &HookContext, delta_x: i32, delta_y: i32) -> EventDisp
     match HOLD.with_borrow_mut(|hold| hold.accumulate(delta_x, delta_y)) {
         HoldOutput::Action(action) => {
             info!(button = %button, action = %action.label(), "gesture swipe → executing bound action");
-            dispatch_action(&action, &context.dpi_cycle, &context.capture);
+            let _ = context.action_emitter.emit(action);
             EventDisposition::PassThrough
         }
         HoldOutput::PanDelta { x, y } => {
@@ -525,6 +554,197 @@ pub fn dispatch_action(
 mod tests {
     use super::*;
     use openlogi_core::binding::{GESTURE_SWIPE_THRESHOLD, PAN_DEADZONE, PanBinding};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn pan_hook_context() -> HookContext {
+        let (queue, _actions) = sync_channel(1);
+        HookContext {
+            hooks: Arc::new(RwLock::new(HookMaps {
+                generation: 1,
+                bindings: BTreeMap::new(),
+                gestures: BTreeMap::from([(
+                    ButtonId::Back,
+                    GestureMode::Pan(PanBinding {
+                        click: Action::SmartZoom,
+                    }),
+                )]),
+            })),
+            action_emitter: ActionEmitter { queue },
+            monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+            pan_emitter: PanEmitter::new(),
+        }
+    }
+
+    fn action_hook_context(capacity: usize) -> (HookContext, std::sync::mpsc::Receiver<Action>) {
+        let (queue, actions) = sync_channel(capacity);
+        (
+            HookContext {
+                hooks: Arc::new(RwLock::new(HookMaps {
+                    generation: 1,
+                    bindings: BTreeMap::from([(ButtonId::Back, Action::Copy)]),
+                    gestures: BTreeMap::new(),
+                })),
+                action_emitter: ActionEmitter { queue },
+                monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+                pan_emitter: PanEmitter::new(),
+            },
+            actions,
+        )
+    }
+
+    #[test]
+    fn ordinary_button_callback_only_enqueues_action() {
+        let (context, actions) = action_hook_context(1);
+        assert_eq!(
+            handle_event(
+                &context,
+                &MouseEvent::Button {
+                    id: ButtonId::Back,
+                    pressed: true,
+                },
+            ),
+            EventDisposition::Suppress
+        );
+        assert_eq!(actions.try_recv(), Ok(Action::Copy));
+    }
+
+    #[test]
+    fn full_action_queue_drops_new_action_without_blocking_callback() {
+        let (context, actions) = action_hook_context(1);
+        assert!(context.action_emitter.emit(Action::Paste));
+
+        assert_eq!(
+            handle_event(
+                &context,
+                &MouseEvent::Button {
+                    id: ButtonId::Back,
+                    pressed: true,
+                },
+            ),
+            EventDisposition::Suppress
+        );
+        assert_eq!(actions.try_recv(), Ok(Action::Paste));
+        assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn pan_click_and_directional_commit_only_enqueue_actions() {
+        let (pan_queue, pan_actions) = sync_channel(2);
+        let mut pan_context = pan_hook_context();
+        pan_context.action_emitter = ActionEmitter { queue: pan_queue };
+        assert_eq!(
+            handle_button(&pan_context, ButtonId::Back, true),
+            EventDisposition::Suppress
+        );
+        assert_eq!(
+            handle_button(&pan_context, ButtonId::Back, false),
+            EventDisposition::Suppress
+        );
+        assert_eq!(pan_actions.try_recv(), Ok(Action::SmartZoom));
+
+        let (directional_queue, directional_actions) = sync_channel(2);
+        let directional_context = HookContext {
+            hooks: Arc::new(RwLock::new(HookMaps {
+                generation: 1,
+                bindings: BTreeMap::new(),
+                gestures: BTreeMap::from([(
+                    ButtonId::Back,
+                    GestureMode::Directional(BTreeMap::from([(
+                        openlogi_core::binding::GestureDirection::Right,
+                        Action::Copy,
+                    )])),
+                )]),
+            })),
+            action_emitter: ActionEmitter {
+                queue: directional_queue,
+            },
+            monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+            pan_emitter: PanEmitter::new(),
+        };
+        assert_eq!(
+            handle_button(&directional_context, ButtonId::Back, true),
+            EventDisposition::Suppress
+        );
+        HOLD.with_borrow_mut(|hold| {
+            let Some(HoldGesture::Directional { swipe, .. }) = hold.gesture.as_mut() else {
+                panic!("directional hold");
+            };
+            swipe.backdate_hold_for_test();
+        });
+        assert_eq!(
+            handle_motion(&directional_context, GESTURE_SWIPE_THRESHOLD + 1, 0),
+            EventDisposition::PassThrough
+        );
+        assert_eq!(directional_actions.try_recv(), Ok(Action::Copy));
+        let _ = HOLD.with_borrow_mut(HoldState::cancel);
+    }
+
+    #[test]
+    fn button_callback_fails_open_immediately_during_projection_write() {
+        let context = Arc::new(pan_hook_context());
+        let Ok(guard) = context.hooks.write() else {
+            panic!("projection write lock");
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_context = Arc::clone(&context);
+        let worker = thread::spawn(move || {
+            let result = handle_event(
+                &worker_context,
+                &MouseEvent::Button {
+                    id: ButtonId::Back,
+                    pressed: true,
+                },
+            );
+            let _ = done_tx.send(result);
+        });
+
+        let result = done_rx.recv_timeout(Duration::from_millis(50));
+        drop(guard);
+        assert!(worker.join().is_ok(), "callback worker panicked");
+        assert_eq!(result, Ok(EventDisposition::PassThrough));
+    }
+
+    #[test]
+    fn active_motion_cancels_immediately_during_projection_write() {
+        let context = Arc::new(pan_hook_context());
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_context = Arc::clone(&context);
+        let worker = thread::spawn(move || {
+            assert_eq!(
+                handle_event(
+                    &worker_context,
+                    &MouseEvent::Button {
+                        id: ButtonId::Back,
+                        pressed: true,
+                    },
+                ),
+                EventDisposition::Suppress
+            );
+            assert!(ready_tx.send(()).is_ok(), "ready receiver dropped");
+            assert!(go_rx.recv().is_ok(), "continue sender dropped");
+            let result = handle_event(
+                &worker_context,
+                &MouseEvent::Moved {
+                    delta_x: PAN_DEADZONE,
+                    delta_y: 0,
+                },
+            );
+            let _ = done_tx.send(result);
+        });
+        assert!(ready_rx.recv().is_ok(), "hold did not start");
+        let Ok(guard) = context.hooks.write() else {
+            panic!("projection write lock");
+        };
+        assert!(go_tx.send(()).is_ok(), "callback worker exited");
+
+        let result = done_rx.recv_timeout(Duration::from_millis(50));
+        drop(guard);
+        assert!(worker.join().is_ok(), "callback worker panicked");
+        assert_eq!(result, Ok(EventDisposition::PassThrough));
+    }
 
     #[test]
     fn pan_hold_suppresses_motion_and_clicks_only_inside_deadzone() {
@@ -600,22 +820,7 @@ mod tests {
 
     #[test]
     fn os_hook_pan_suppresses_press_and_motion_until_interrupted() {
-        let context = HookContext {
-            hooks: Arc::new(RwLock::new(HookMaps {
-                generation: 1,
-                bindings: BTreeMap::new(),
-                gestures: BTreeMap::from([(
-                    ButtonId::Back,
-                    GestureMode::Pan(PanBinding {
-                        click: Action::None,
-                    }),
-                )]),
-            })),
-            dpi_cycle: Arc::new(RwLock::new(DpiCycleState::default())),
-            capture: Arc::new(RwLock::new(None)),
-            monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
-            pan_emitter: PanEmitter::new(),
-        };
+        let context = pan_hook_context();
 
         assert_eq!(
             handle_event(

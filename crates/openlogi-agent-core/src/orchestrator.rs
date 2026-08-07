@@ -11,7 +11,7 @@
 //! (still valid) values — exactly the GUI's "window never opened" behaviour.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::config::{Config, ScrollResolution};
@@ -60,6 +60,9 @@ pub struct SharedRuntime {
     pub capture_channel: CaptureChannel,
     /// Non-blocking coalescing sink used by both gesture input paths.
     pub pan_emitter: PanEmitter,
+    /// Invalidates queued HID capture input whenever the active projection or
+    /// capture session changes.
+    pub capture_epoch: Arc<AtomicU64>,
     /// Exclusive receiver access shared by HID++ capture and pairing. Capture
     /// and pairing must never open the same receiver HID node concurrently.
     pub receiver_access: ReceiverAccess,
@@ -115,6 +118,7 @@ impl Orchestrator {
             )),
             capture_channel: Arc::new(RwLock::new(None)),
             pan_emitter: PanEmitter::new(),
+            capture_epoch: Arc::new(AtomicU64::new(0)),
             receiver_access: ReceiverAccess::default(),
         };
         let mut orch = Self {
@@ -163,6 +167,7 @@ impl Orchestrator {
     /// Rewrite every shared map from the current config + selected device.
     fn rebuild(&mut self) {
         self.gesture_generation = self.gesture_generation.wrapping_add(1);
+        self.shared.capture_epoch.fetch_add(1, Ordering::AcqRel);
         let key = self.current_key();
         // One write publishes both hook maps atomically, so a button press during
         // an owner switch can't observe a half-updated state.
@@ -357,6 +362,7 @@ impl Orchestrator {
         }
         self.current_app = bundle;
         self.gesture_generation = self.gesture_generation.wrapping_add(1);
+        self.shared.capture_epoch.fetch_add(1, Ordering::AcqRel);
         write_value(
             &self.shared.hook_maps,
             self.hook_maps_for(self.current_key(), self.current_app.as_deref()),

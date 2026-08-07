@@ -20,7 +20,7 @@
 //! the events arrive over HID++, and the bound action is synthesised the same
 //! way regardless.
 
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,6 +68,34 @@ const ACTION_DECAY: Duration = Duration::from_millis(300);
 /// deliberate flick triggers once instead of repeating across a fast spin.
 const ACTION_COOLDOWN: Duration = Duration::from_millis(200);
 
+struct SessionInput {
+    epoch: u64,
+    input: CapturedInput,
+}
+
+fn take_current_input(message: &SessionInput, live_epoch: u64) -> Option<CapturedInput> {
+    (message.epoch == live_epoch).then_some(message.input)
+}
+
+/// Shared invalidation state for HID capture sessions.
+#[derive(Clone)]
+pub struct CaptureSessionControl {
+    receiver_access: ReceiverAccess,
+    epoch: Arc<AtomicU64>,
+}
+
+impl CaptureSessionControl {
+    /// Couple exclusive receiver ownership with the epoch that invalidates
+    /// already-queued input from superseded sessions.
+    #[must_use]
+    pub fn new(receiver_access: ReceiverAccess, epoch: Arc<AtomicU64>) -> Self {
+        Self {
+            receiver_access,
+            epoch,
+        }
+    }
+}
+
 /// Speed multiplier for the wheel's continuous horizontal scroll. The default
 /// sensitivity is 1×; the scale is linear around it.
 #[allow(
@@ -93,8 +121,8 @@ pub fn spawn(
     dpi_cycle: Arc<RwLock<DpiCycleState>>,
     capture_channel: CaptureChannel,
     thumbwheel_sensitivity: ThumbwheelSensitivity,
-    receiver_access: ReceiverAccess,
     pan_emitter: PanEmitter,
+    session_control: CaptureSessionControl,
 ) {
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -113,8 +141,8 @@ pub fn spawn(
             dpi_cycle,
             capture_channel,
             thumbwheel_sensitivity,
-            receiver_access,
             pan_emitter,
+            session_control,
         ));
     });
 }
@@ -159,18 +187,22 @@ fn should_rearm(done_epoch: u64, live_epoch: u64, has_target: bool) -> bool {
 /// Keep one capture session alive for the active device, restarting it when the
 /// device or the thumb-wheel arming changes, and dispatch incoming inputs. Runs
 /// for the lifetime of the process.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the select loop keeps capture start, stop, input, and completion transitions together"
+)]
 async fn manage(
     hook_maps: SharedHookMaps,
     gesture_bindings: GestureBindings,
     dpi_cycle: Arc<RwLock<DpiCycleState>>,
     capture_channel: CaptureChannel,
     thumbwheel_sensitivity: ThumbwheelSensitivity,
-    receiver_access: ReceiverAccess,
     pan_emitter: PanEmitter,
+    session_control: CaptureSessionControl,
 ) {
-    let (tx, mut rx) = mpsc::unbounded_channel::<CapturedInput>();
-    // (route, capture_thumbwheel, divert_gesture_button)
-    let mut current: Option<(DeviceRoute, bool, bool)> = None;
+    let (tx, mut rx) = mpsc::unbounded_channel::<SessionInput>();
+    // (route, capture_thumbwheel, divert_gesture_button, input epoch)
+    let mut current: Option<(DeviceRoute, bool, bool, u64)> = None;
     let mut stop: Option<oneshot::Sender<()>> = None;
     let mut ticker = tokio::time::interval(TARGET_POLL);
     let mut dispatch_state = CaptureDispatchState::default();
@@ -183,11 +215,21 @@ async fn manage(
     // under, so a dead *current* session can be re-armed while stale completions
     // (from an already-superseded session) are ignored.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<u64>();
-    let mut epoch: u64 = 0;
 
     loop {
         tokio::select! {
-            Some(input) = rx.recv() => {
+            Some(message) = rx.recv() => {
+                let live_epoch = session_control.epoch.load(Ordering::Acquire);
+                let session_is_live = current
+                    .as_ref()
+                    .is_some_and(|(_, _, _, epoch)| *epoch == live_epoch);
+                let Some(input) = session_is_live
+                    .then(|| take_current_input(&message, live_epoch))
+                    .flatten()
+                else {
+                    dispatch_state.gesture.cancel();
+                    continue;
+                };
                 dispatch(
                     input,
                     &mut dispatch_state,
@@ -205,7 +247,7 @@ async fn manage(
                 // While pairing is waiting or active, release the capture
                 // session so run_pairing can own the receiver's HID node (one
                 // process can't read it through two channels).
-                let want = if receiver_access.pairing_requested() {
+                let want = if session_control.receiver_access.pairing_requested() {
                     None
                 } else {
                     let target = dpi_cycle.read().ok().and_then(|guard| guard.target.clone());
@@ -218,11 +260,13 @@ async fn manage(
                     let divert_gesture = gesture_bindings
                         .read()
                         .is_ok_and(|state| state.mode.is_some());
+                    let input_epoch = session_control.epoch.load(Ordering::Acquire);
                     target.map(|t| {
                         (
                             t,
                             thumbwheel_armed(&hook_maps, sensitivity),
                             divert_gesture,
+                            input_epoch,
                         )
                     })
                 };
@@ -237,20 +281,34 @@ async fn manage(
                     let _ = stop.send(());
                 }
                 if current.is_some() {
+                    if want.is_none() {
+                        session_control.epoch.fetch_add(1, Ordering::AcqRel);
+                    }
                     current = None;
                     continue;
                 }
-                if let Some((route, capture_thumbwheel, divert_gesture_button)) = want {
-                    let Some(receiver_lease) = receiver_access.try_acquire_for_capture() else {
+                if let Some((route, capture_thumbwheel, divert_gesture_button, session_epoch)) = want {
+                    let Some(receiver_lease) = session_control.receiver_access.try_acquire_for_capture() else {
                         current = None;
                         continue;
                     };
-                    current = Some((route.clone(), capture_thumbwheel, divert_gesture_button));
+                    current = Some((
+                        route.clone(),
+                        capture_thumbwheel,
+                        divert_gesture_button,
+                        session_epoch,
+                    ));
                     let (stop_tx, stop_rx) = oneshot::channel();
-                    let sink = tx.clone();
+                    let (sink, mut session_rx) = mpsc::unbounded_channel();
+                    let tagged_sink = tx.clone();
+                    tokio::spawn(async move {
+                        while let Some(input) = session_rx.recv().await {
+                            if tagged_sink.send(SessionInput { epoch: session_epoch, input }).is_err() {
+                                break;
+                            }
+                        }
+                    });
                     let slot = Arc::clone(&capture_channel);
-                    epoch = epoch.wrapping_add(1);
-                    let session_epoch = epoch;
                     let done = done_tx.clone();
                     tokio::spawn(async move {
                         let _receiver_lease = receiver_lease;
@@ -282,8 +340,10 @@ async fn manage(
                 // The tick fires at most once per `TARGET_POLL`, which paces the
                 // respawn so a permanently failing device can't hot-loop. A stale
                 // epoch or a deliberate stop-to-idle is a no-op (see `should_rearm`).
-                if should_rearm(done_epoch, epoch, current.is_some()) {
+                let live_epoch = session_control.epoch.load(Ordering::Acquire);
+                if should_rearm(done_epoch, live_epoch, current.is_some()) {
                     warn!("capture session for the active device ended unexpectedly, re-arming");
+                    session_control.epoch.fetch_add(1, Ordering::AcqRel);
                     dispatch_state.gesture.cancel();
                     current = None;
                     // Keep the `stop`/`current` invariant: the session already
@@ -593,6 +653,37 @@ mod tests {
     use std::collections::BTreeMap;
 
     use openlogi_core::binding::{PAN_DEADZONE, PanBinding};
+
+    #[test]
+    fn stale_session_lifecycle_cannot_trigger_new_pan_binding() {
+        let mode = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let mut gesture = GestureDispatchState::default();
+        gesture.cancel();
+        let deadzone = i16::try_from(PAN_DEADZONE).unwrap_or_default();
+        let queued = [
+            CapturedInput::GesturePressed,
+            CapturedInput::GestureReleased,
+            CapturedInput::GesturePressed,
+            CapturedInput::GestureMotion {
+                delta_x: deadzone,
+                delta_y: -deadzone,
+            },
+            CapturedInput::GestureReleased,
+        ];
+        let mut outputs = Vec::new();
+
+        for input in queued {
+            let tagged = SessionInput { epoch: 7, input };
+            if let Some(input) = take_current_input(&tagged, 8) {
+                outputs.push(advance_gesture(&mut gesture, 8, &mode, input));
+            }
+        }
+
+        assert!(outputs.is_empty(), "stale input must not reach policy");
+        assert!(gesture.mode.is_none());
+    }
 
     #[test]
     fn hid_pan_lifecycle_emits_delta_then_ends_without_click() {
