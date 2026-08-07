@@ -1,149 +1,328 @@
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::*;
 
-fn press() -> RawControlEvent {
-    RawControlEvent::DivertedButtons([reprog_controls::GESTURE_BUTTON_CID, 0, 0, 0])
+fn gesture_controls(buttons: &[ButtonId]) -> BTreeMap<u16, ButtonId> {
+    buttons
+        .iter()
+        .copied()
+        .filter_map(|button| {
+            reprog_controls::gesture_cid_for_button(button).map(|cid| (cid, button))
+        })
+        .collect()
 }
 
-fn release() -> RawControlEvent {
-    RawControlEvent::DivertedButtons([0, 0, 0, 0])
+fn diverted(cids: &[u16]) -> RawControlEvent {
+    let mut report = [0; 4];
+    report[..cids.len()].copy_from_slice(cids);
+    RawControlEvent::DivertedButtons(report)
 }
 
 #[test]
-fn gesture_reports_raw_press_motion_and_release_lifecycle() {
+fn back_reports_press_motion_and_release_with_its_identity() {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Back]);
+    let back = reprog_controls::BACK_BUTTON_CID;
     let mut acc = CaptureAccum::default();
 
-    handle_reprog(&mut acc, press(), &[], &tx);
+    handle_reprog(&mut acc, diverted(&[back]), &gestures, &[], &tx);
     handle_reprog(
         &mut acc,
         RawControlEvent::RawXy { dx: -120, dy: 5 },
+        &gestures,
         &[],
         &tx,
     );
-    handle_reprog(&mut acc, release(), &[], &tx);
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
 
     assert_eq!(
         [rx.try_recv(), rx.try_recv(), rx.try_recv()],
         [
-            Ok(CapturedInput::GesturePressed),
+            Ok(CapturedInput::GesturePressed(ButtonId::Back)),
             Ok(CapturedInput::GestureMotion {
+                button: ButtonId::Back,
                 delta_x: -120,
                 delta_y: 5,
             }),
-            Ok(CapturedInput::GestureReleased),
+            Ok(CapturedInput::GestureReleased(ButtonId::Back)),
         ]
     );
     assert!(rx.try_recv().is_err());
 }
 
 #[test]
-fn raw_motion_is_forwarded_only_while_the_gesture_cid_is_held() {
+fn forward_reports_press_motion_and_release_with_its_identity() {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Forward]);
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
     let mut acc = CaptureAccum::default();
 
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
     handle_reprog(
         &mut acc,
         RawControlEvent::RawXy { dx: 10, dy: -20 },
+        &gestures,
         &[],
         &tx,
     );
-    assert!(rx.try_recv().is_err(), "motion before press is ignored");
-
-    handle_reprog(&mut acc, press(), &[], &tx);
-    handle_reprog(&mut acc, press(), &[], &tx);
-    handle_reprog(
-        &mut acc,
-        RawControlEvent::RawXy { dx: 10, dy: -20 },
-        &[],
-        &tx,
-    );
-    handle_reprog(&mut acc, release(), &[], &tx);
-    handle_reprog(
-        &mut acc,
-        RawControlEvent::RawXy { dx: 30, dy: 40 },
-        &[],
-        &tx,
-    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
 
     assert_eq!(
         [rx.try_recv(), rx.try_recv(), rx.try_recv()],
         [
-            Ok(CapturedInput::GesturePressed),
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
             Ok(CapturedInput::GestureMotion {
+                button: ButtonId::Forward,
                 delta_x: 10,
                 delta_y: -20,
             }),
-            Ok(CapturedInput::GestureReleased),
-        ],
-        "a repeated held frame does not create another rising edge"
+            Ok(CapturedInput::GestureReleased(ButtonId::Forward)),
+        ]
     );
-    assert!(rx.try_recv().is_err(), "motion after release is ignored");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
-fn closing_an_active_capture_cancels_once_and_ignores_late_events() {
+fn an_unrequested_gesture_cid_is_not_captured() {
     let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Back]);
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
     let mut acc = CaptureAccum::default();
 
-    handle_reprog(&mut acc, press(), &[], &tx);
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 3, dy: 4 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
+
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn switching_gesture_controls_cancels_the_old_button_before_pressing_the_new_one() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Back, ButtonId::Forward]);
+    let back = reprog_controls::BACK_BUTTON_CID;
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, diverted(&[back]), &gestures, &[], &tx);
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed(ButtonId::Back)),
+            Ok(CapturedInput::GestureCancelled(ButtonId::Back)),
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn simultaneous_gesture_controls_cancel_and_ignore_ambiguous_raw_xy() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Back, ButtonId::Forward]);
+    let back = reprog_controls::BACK_BUTTON_CID;
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, diverted(&[back]), &gestures, &[], &tx);
+    handle_reprog(&mut acc, diverted(&[back, forward]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 40, dy: 60 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed(ButtonId::Back)),
+            Ok(CapturedInput::GestureCancelled(ButtonId::Back)),
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
+        ]
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "raw XY with two held gesture controls has no reliable source"
+    );
+}
+
+#[test]
+fn closing_an_active_capture_cancels_its_button_once_and_ignores_late_events() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Forward]);
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
     close_capture(&mut acc, &tx);
     close_capture(&mut acc, &tx);
-    // A listener callback can already hold a cloned callback list when its
-    // guard is dropped. Simulate that callback entering after teardown.
-    handle_reprog(&mut acc, press(), &[], &tx);
-    handle_reprog(&mut acc, RawControlEvent::RawXy { dx: 4, dy: -7 }, &[], &tx);
-    handle_reprog(&mut acc, release(), &[], &tx);
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 4, dy: -7 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
 
     assert_eq!(
         [rx.try_recv(), rx.try_recv()],
         [
-            Ok(CapturedInput::GesturePressed),
-            Ok(CapturedInput::GestureCancelled),
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
+            Ok(CapturedInput::GestureCancelled(ButtonId::Forward)),
         ]
     );
     assert!(rx.try_recv().is_err());
 }
 
 #[test]
-fn a_held_dpi_button_presses_once_on_the_rising_edge() {
-    let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut acc = CaptureAccum::default();
-    let dpi = reprog_controls::DPI_MODE_SHIFT_CIDS[0];
-    let down = RawControlEvent::DivertedButtons([dpi, 0, 0, 0]);
+fn selection_requires_request_diversion_and_raw_xy_capability() {
+    let requested = BTreeSet::from([ButtonId::Back, ButtonId::Forward]);
+    let back = reprog_controls::BACK_BUTTON_CID;
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let controls = [
+        reprog_controls::CtrlIdInfo {
+            cid: back,
+            task_id: 0,
+            flags: (reprog_controls::CidFlags::DIVERTABLE | reprog_controls::CidFlags::RAW_XY)
+                .raw(),
+        },
+        reprog_controls::CtrlIdInfo {
+            cid: forward,
+            task_id: 0,
+            flags: reprog_controls::CidFlags::DIVERTABLE.raw(),
+        },
+        reprog_controls::CtrlIdInfo {
+            cid: reprog_controls::MIDDLE_BUTTON_CID,
+            task_id: 0,
+            flags: (reprog_controls::CidFlags::DIVERTABLE | reprog_controls::CidFlags::RAW_XY)
+                .raw(),
+        },
+    ];
 
-    handle_reprog(&mut acc, down, &[dpi], &tx);
-    handle_reprog(&mut acc, down, &[dpi], &tx);
+    assert_eq!(
+        select_gesture_controls(&requested, &controls),
+        BTreeMap::from([(back, ButtonId::Back)])
+    );
+}
+
+#[tokio::test]
+async fn gesture_reporting_rolls_back_prior_cids_when_a_later_enable_fails() {
+    let calls = RefCell::new(Vec::new());
+    let outcome = RefCell::new([Ok(()), Err("forward enable failed"), Ok(())].into_iter());
+
+    let result = set_gesture_reporting_transactionally(
+        [
+            reprog_controls::BACK_BUTTON_CID,
+            reprog_controls::FORWARD_BUTTON_CID,
+        ],
+        |cid, diverted, raw_xy| {
+            calls.borrow_mut().push((cid, diverted, raw_xy));
+            std::future::ready(outcome.borrow_mut().next().unwrap_or(Ok(())))
+        },
+    )
+    .await;
+
+    assert_eq!(result, Err("forward enable failed"));
+    assert_eq!(
+        calls.into_inner(),
+        [
+            (reprog_controls::BACK_BUTTON_CID, true, true),
+            (reprog_controls::FORWARD_BUTTON_CID, true, true),
+            (reprog_controls::BACK_BUTTON_CID, false, false),
+        ]
+    );
+}
+
+#[test]
+fn dpi_cids_remain_plain_buttons_and_never_become_gesture_sources() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Back]);
+    let dpi = reprog_controls::DPI_MODE_SHIFT_CIDS[0];
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, diverted(&[dpi]), &gestures, &[dpi], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 8, dy: 9 },
+        &gestures,
+        &[dpi],
+        &tx,
+    );
 
     assert_eq!(
         rx.try_recv(),
         Ok(CapturedInput::ButtonPressed(ButtonId::DpiToggle))
     );
-    assert!(rx.try_recv().is_err(), "a held DPI button presses once");
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn gesture_button_cid_mapping_matches_the_m650_and_dedicated_control_table() {
+    assert_eq!(
+        reprog_controls::gesture_cid_for_button(ButtonId::MiddleClick),
+        Some(0x0052)
+    );
+    assert_eq!(
+        reprog_controls::gesture_cid_for_button(ButtonId::Back),
+        Some(0x0053)
+    );
+    assert_eq!(
+        reprog_controls::gesture_cid_for_button(ButtonId::Forward),
+        Some(0x0056)
+    );
+    assert_eq!(
+        reprog_controls::gesture_cid_for_button(ButtonId::GestureButton),
+        Some(0x00c3)
+    );
+    assert_eq!(
+        reprog_controls::gesture_cid_for_button(ButtonId::DpiToggle),
+        None
+    );
+
+    for (button, cid) in [
+        (ButtonId::MiddleClick, reprog_controls::MIDDLE_BUTTON_CID),
+        (ButtonId::Back, reprog_controls::BACK_BUTTON_CID),
+        (ButtonId::Forward, reprog_controls::FORWARD_BUTTON_CID),
+        (ButtonId::GestureButton, reprog_controls::GESTURE_BUTTON_CID),
+    ] {
+        assert_eq!(reprog_controls::gesture_button_for_cid(cid), Some(button));
+    }
+    assert_eq!(reprog_controls::gesture_button_for_cid(0x00c4), None);
 }
 
 #[test]
 fn a_dpi_button_re_presses_after_a_release() {
-    // Rising-edge detection must re-arm: press → release → press is two
-    // distinct presses. The release (a frame without the CID) is what resets
-    // the edge; without it a re-press would be swallowed as "still held".
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let mut acc = CaptureAccum::default();
+    let gestures = BTreeMap::new();
     let dpi = reprog_controls::DPI_MODE_SHIFT_CIDS[0];
-    let down = RawControlEvent::DivertedButtons([dpi, 0, 0, 0]);
-    let up = RawControlEvent::DivertedButtons([0, 0, 0, 0]);
+    let down = diverted(&[dpi]);
+    let up = diverted(&[]);
+    let mut acc = CaptureAccum::default();
 
-    handle_reprog(&mut acc, down, &[dpi], &tx);
-    handle_reprog(&mut acc, up, &[dpi], &tx);
-    handle_reprog(&mut acc, down, &[dpi], &tx);
+    handle_reprog(&mut acc, down, &gestures, &[dpi], &tx);
+    handle_reprog(&mut acc, up, &gestures, &[dpi], &tx);
+    handle_reprog(&mut acc, down, &gestures, &[dpi], &tx);
 
     assert_eq!(
-        rx.try_recv(),
-        Ok(CapturedInput::ButtonPressed(ButtonId::DpiToggle))
-    );
-    assert_eq!(
-        rx.try_recv(),
-        Ok(CapturedInput::ButtonPressed(ButtonId::DpiToggle)),
-        "a release re-arms the rising edge"
+        [rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::ButtonPressed(ButtonId::DpiToggle)),
+            Ok(CapturedInput::ButtonPressed(ButtonId::DpiToggle)),
+        ]
     );
     assert!(rx.try_recv().is_err());
 }

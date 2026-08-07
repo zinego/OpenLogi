@@ -21,6 +21,7 @@ use hidpp::{
     feature::{CreatableFeature, reprog_controls as hidpp_reprog},
     protocol::v20::Hidpp20Error,
 };
+use openlogi_core::binding::ButtonId;
 
 mod event;
 
@@ -42,6 +43,50 @@ pub const FEATURE_ID: u16 = 0x1b04;
 /// control table and supported explicitly before OpenLogi treats it as a
 /// bindable/capturable input.
 pub const GESTURE_BUTTON_CID: u16 = 0x00c3;
+
+/// Control ID of the middle mouse button in Logitech's `0x1b04` control table.
+pub const MIDDLE_BUTTON_CID: u16 = 0x0052;
+
+/// Control ID of the thumb-side Back button in Logitech's `0x1b04` control table.
+pub const BACK_BUTTON_CID: u16 = 0x0053;
+
+/// Control ID of the thumb-side Forward button in Logitech's `0x1b04` control table.
+pub const FORWARD_BUTTON_CID: u16 = 0x0056;
+
+/// Map a reprogrammable-control CID to the logical button whose gesture
+/// lifecycle it represents.
+///
+/// These values are the control IDs reported by the HID++ `0x1b04` table on
+/// the M650 (`0x0052`, `0x0053`, `0x0056`) plus Logitech's dedicated gesture
+/// control (`0x00c3`). Other controls, including DPI/ModeShift CIDs, are not
+/// gesture sources.
+#[must_use]
+pub fn gesture_button_for_cid(cid: u16) -> Option<ButtonId> {
+    match cid {
+        MIDDLE_BUTTON_CID => Some(ButtonId::MiddleClick),
+        BACK_BUTTON_CID => Some(ButtonId::Back),
+        FORWARD_BUTTON_CID => Some(ButtonId::Forward),
+        GESTURE_BUTTON_CID => Some(ButtonId::GestureButton),
+        _ => None,
+    }
+}
+
+/// Map a logical gesture-capable button to its HID++ `0x1b04` control ID.
+#[must_use]
+pub fn gesture_cid_for_button(button: ButtonId) -> Option<u16> {
+    match button {
+        ButtonId::MiddleClick => Some(MIDDLE_BUTTON_CID),
+        ButtonId::Back => Some(BACK_BUTTON_CID),
+        ButtonId::Forward => Some(FORWARD_BUTTON_CID),
+        ButtonId::GestureButton => Some(GESTURE_BUTTON_CID),
+        ButtonId::LeftClick
+        | ButtonId::RightClick
+        | ButtonId::DpiToggle
+        | ButtonId::Thumbwheel
+        | ButtonId::ThumbwheelScrollUp
+        | ButtonId::ThumbwheelScrollDown => None,
+    }
+}
 
 /// Control IDs of the "DPI / ModeShift" button family. Whichever a device
 /// exposes (and can divert) is captured and mapped to
