@@ -267,9 +267,10 @@ fn button_number_to_id(n: i64) -> Option<ButtonId> {
 /// for event types we don't translate (e.g. move events, unknown buttons).
 fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
     // Skip events OpenLogi itself synthesised, so a remapped click or inverted
-    // scroll we posted doesn't re-enter the hook as real input. Gate the field
-    // read to events we synthesize — keeping the FFI call off the high-rate
-    // pointer-move stream.
+    // scroll or pointer-freeze replacement we posted doesn't re-enter the hook
+    // as real input. Pointer movement must participate: CoreGraphics can feed a
+    // replacement motion back through the tap while the physical device keeps
+    // reporting its displaced absolute position.
     let can_be_synthetic = matches!(
         etype,
         CGEventType::LeftMouseDown
@@ -278,6 +279,10 @@ fn translate(etype: CGEventType, event: &CGEvent) -> Option<MouseEvent> {
             | CGEventType::RightMouseUp
             | CGEventType::OtherMouseDown
             | CGEventType::OtherMouseUp
+            | CGEventType::MouseMoved
+            | CGEventType::LeftMouseDragged
+            | CGEventType::RightMouseDragged
+            | CGEventType::OtherMouseDragged
             | CGEventType::ScrollWheel
     );
     if can_be_synthetic
@@ -551,6 +556,10 @@ fn pointer_freeze_replacement(event: &CGEvent, anchor: [f64; 2]) -> Option<CGEve
     copied.set_location(CGPoint::new(anchor[0], anchor[1]));
     copied.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 0);
     copied.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0);
+    copied.set_integer_value_field(
+        EventField::EVENT_SOURCE_USER_DATA,
+        openlogi_inject::SYNTHETIC_EVENT_USER_DATA,
+    );
     Some(copied)
 }
 
@@ -935,5 +944,10 @@ mod tests {
             replacement.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y),
             0
         );
+        assert_eq!(
+            replacement.get_integer_value_field(EventField::EVENT_SOURCE_USER_DATA),
+            openlogi_inject::SYNTHETIC_EVENT_USER_DATA
+        );
+        assert!(translate(CGEventType::OtherMouseDragged, &replacement).is_none());
     }
 }
