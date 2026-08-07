@@ -58,6 +58,9 @@ pub(super) fn execute(action: &Action) {
                 "no Linux equivalent — action skipped"
             );
         }
+        Action::SmartZoom => {
+            tracing::debug!("Smart Zoom is macOS-only — action skipped");
+        }
         // Ctrl+Alt+←/→ is the default in GNOME and KDE.
         Action::PreviousDesktop => press_key(&[ctrl, alt], KeyCode::KEY_LEFT),
         Action::NextDesktop => press_key(&[ctrl, alt], KeyCode::KEY_RIGHT),

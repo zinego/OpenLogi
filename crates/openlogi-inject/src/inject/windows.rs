@@ -101,6 +101,9 @@ pub(super) fn execute(action: &Action) {
         }
         Action::ShowDesktop => post_key(VK_D, &[VK_LWIN]),
         Action::LaunchpadShow => post_key(VK_LWIN, &[]),
+        Action::SmartZoom => {
+            tracing::debug!("Smart Zoom is macOS-only; action skipped");
+        }
         Action::LockScreen => post_key(VK_L, &[VK_LWIN]),
         // Win+Shift+S opens the snip overlay, which serves both full-screen
         // and region capture on Windows.
