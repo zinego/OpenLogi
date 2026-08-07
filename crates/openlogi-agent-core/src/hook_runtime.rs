@@ -842,16 +842,17 @@ mod tests {
             ),
             EventDisposition::Suppress
         );
-        assert_eq!(
-            handle_event(
-                &context,
-                &MouseEvent::Moved {
-                    delta_x: 1,
-                    delta_y: -1,
-                },
-            ),
-            EventDisposition::FreezePointer
+        let motion = handle_event(
+            &context,
+            &MouseEvent::Moved {
+                delta_x: 1,
+                delta_y: -1,
+            },
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(motion, EventDisposition::FreezePointer);
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(motion, EventDisposition::Suppress);
         assert_eq!(
             handle_event(&context, &MouseEvent::CaptureInterrupted),
             EventDisposition::PassThrough
