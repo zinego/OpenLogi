@@ -22,6 +22,7 @@ use tracing::warn;
 use crate::DpiCycleState;
 use crate::bindings::{bindings_for, hid_gesture_for, oshook_gestures_for};
 use crate::device_order::DeviceStableId;
+use crate::gesture_coordinator::GestureCoordinator;
 use crate::hook_runtime::{HookMaps, PanEmitter, SharedHookMaps};
 use crate::ipc::InventoryHealth;
 use crate::receiver_access::ReceiverAccess;
@@ -60,6 +61,8 @@ pub struct SharedRuntime {
     pub capture_channel: CaptureChannel,
     /// Non-blocking coalescing sink used by both gesture input paths.
     pub pan_emitter: PanEmitter,
+    /// Lock-free newest-press arbitration shared by both gesture input paths.
+    pub gesture_coordinator: GestureCoordinator,
     /// Invalidates queued HID capture input whenever the active projection or
     /// capture session changes.
     pub capture_epoch: CaptureEpoch,
@@ -118,6 +121,7 @@ impl Orchestrator {
             )),
             capture_channel: Arc::new(RwLock::new(None)),
             pan_emitter: PanEmitter::new(),
+            gesture_coordinator: GestureCoordinator::default(),
             capture_epoch: CaptureEpoch::default(),
             receiver_access: ReceiverAccess::default(),
         };

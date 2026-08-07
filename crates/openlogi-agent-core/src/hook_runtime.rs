@@ -22,6 +22,7 @@ use tracing::{info, warn};
 use crate::DpiCycleState;
 use crate::bindings::GestureMode;
 use crate::event_monitor::SharedEventMonitor;
+use crate::gesture_coordinator::{GestureCoordinator, GestureToken};
 use crate::hardware::{toggle_smartshift_in_background, write_dpi_in_background};
 
 /// The two button maps the OS-hook callback reads, kept behind ONE lock so a
@@ -100,6 +101,8 @@ enum HoldOutput {
 struct HoldState {
     button: Option<ButtonId>,
     generation: u64,
+    coordinator: GestureCoordinator,
+    token: Option<GestureToken>,
     gesture: Option<HoldGesture>,
 }
 
@@ -111,6 +114,7 @@ impl HoldState {
         }
         self.button = Some(button);
         self.generation = generation;
+        self.token = Some(self.coordinator.acquire());
         self.gesture = Some(match mode {
             GestureMode::Directional(directions) => {
                 let mut swipe = SwipeAccumulator::default();
@@ -137,7 +141,12 @@ impl HoldState {
     }
 
     fn mode_matches(&self, button: ButtonId, mode: Option<&GestureMode>, generation: u64) -> bool {
-        if self.button != Some(button) || self.generation != generation {
+        if self.button != Some(button)
+            || self.generation != generation
+            || !self
+                .token
+                .is_some_and(|token| self.coordinator.is_current(token))
+        {
             return false;
         }
         matches!(
@@ -157,6 +166,10 @@ impl HoldState {
 
     fn active_button(&self) -> Option<ButtonId> {
         self.button
+    }
+
+    fn coordinate_with(&mut self, coordinator: GestureCoordinator) {
+        self.coordinator = coordinator;
     }
 
     /// Feed a pointer-move delta into the active hold, tagging a committed swipe
@@ -195,6 +208,7 @@ impl HoldState {
             return None;
         }
         self.button = None;
+        self.token = None;
         let gesture = self.gesture.take()?;
         Some(match gesture {
             HoldGesture::Directional {
@@ -228,6 +242,7 @@ impl HoldState {
     /// that the next stray pointer move turns into a phantom swipe.
     fn cancel(&mut self) -> HoldOutput {
         self.button = None;
+        self.token = None;
         if let Some(HoldGesture::Pan { accumulator, .. }) = self.gesture.as_mut() {
             let _ = accumulator.cancel();
         }
@@ -354,6 +369,7 @@ pub fn start(
     capture: CaptureChannel,
     monitor: SharedEventMonitor,
     pan_emitter: PanEmitter,
+    gesture_coordinator: GestureCoordinator,
 ) -> Option<Hook> {
     if !Hook::has_accessibility() {
         warn!(
@@ -368,6 +384,7 @@ pub fn start(
         action_emitter: ActionEmitter::new(dpi_cycle, capture),
         monitor,
         pan_emitter,
+        gesture_coordinator,
     };
     // The per-hold pointer accumulator lives in the thread-local `HOLD`; the
     // callback must never block — see the freeze-hazard note in `macos.rs`.
@@ -390,6 +407,7 @@ struct HookContext {
     action_emitter: ActionEmitter,
     monitor: SharedEventMonitor,
     pan_emitter: PanEmitter,
+    gesture_coordinator: GestureCoordinator,
 }
 
 fn handle_event(context: &HookContext, event: &MouseEvent) -> EventDisposition {
@@ -427,7 +445,10 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
 
     if pressed {
         if let Some(gesture) = gesture {
-            HOLD.with_borrow_mut(|hold| hold.begin(id, gesture, generation));
+            HOLD.with_borrow_mut(|hold| {
+                hold.coordinate_with(context.gesture_coordinator.clone());
+                hold.begin(id, gesture, generation);
+            });
             return EventDisposition::Suppress;
         }
     } else {
@@ -586,6 +607,7 @@ mod tests {
             action_emitter: ActionEmitter { queue },
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
+            gesture_coordinator: GestureCoordinator::default(),
         }
     }
 
@@ -601,6 +623,7 @@ mod tests {
                 action_emitter: ActionEmitter { queue },
                 monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
                 pan_emitter: PanEmitter::new(),
+                gesture_coordinator: GestureCoordinator::default(),
             },
             actions,
         )
@@ -674,6 +697,7 @@ mod tests {
             },
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
+            gesture_coordinator: GestureCoordinator::default(),
         };
         assert_eq!(
             handle_button(&directional_context, ButtonId::Back, true),
@@ -878,6 +902,47 @@ mod tests {
         assert_eq!(hold.cancel(), HoldOutput::Suppress);
         assert_eq!(hold.end(ButtonId::Back), None);
         assert_eq!(hold.end(ButtonId::Forward), None);
+    }
+
+    #[test]
+    fn dedicated_press_invalidates_os_hold_without_phantom_click() {
+        for button in [ButtonId::Back, ButtonId::Forward] {
+            let (queue, actions) = sync_channel(1);
+            let context = HookContext {
+                hooks: Arc::new(RwLock::new(HookMaps {
+                    generation: 7,
+                    bindings: BTreeMap::new(),
+                    gestures: BTreeMap::from([(
+                        button,
+                        GestureMode::Pan(PanBinding {
+                            click: Action::SmartZoom,
+                        }),
+                    )]),
+                })),
+                action_emitter: ActionEmitter { queue },
+                monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+                pan_emitter: PanEmitter::new(),
+                gesture_coordinator: GestureCoordinator::default(),
+            };
+            let _ = HOLD.with_borrow_mut(HoldState::cancel);
+            assert_eq!(
+                handle_button(&context, button, true),
+                EventDisposition::Suppress
+            );
+
+            let _dedicated = context.gesture_coordinator.acquire();
+            assert_eq!(
+                handle_motion(&context, PAN_DEADZONE, -7),
+                EventDisposition::PassThrough,
+                "stale OS motion must not pan or dispatch"
+            );
+            assert_eq!(
+                handle_button(&context, button, false),
+                EventDisposition::PassThrough,
+                "release after stale motion must not click"
+            );
+            assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
+        }
     }
 
     #[test]

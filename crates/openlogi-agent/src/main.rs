@@ -172,6 +172,7 @@ async fn run(config: Config) {
         watchers::gesture::CaptureSessionControl::new(
             shared.receiver_access.clone(),
             shared.capture_epoch.clone(),
+            shared.gesture_coordinator.clone(),
         ),
     );
 
@@ -239,6 +240,7 @@ async fn run(config: Config) {
                             shared.capture_channel.clone(),
                             Arc::clone(&event_monitor),
                             shared.pan_emitter.clone(),
+                            shared.gesture_coordinator.clone(),
                         );
                         hook_installed.store(hook.is_some(), Ordering::Relaxed);
                     } else {

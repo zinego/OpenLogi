@@ -273,6 +273,8 @@ mod tests {
             thumbwheel_sensitivity: Arc::new(0.into()),
             capture_channel: Arc::new(RwLock::new(None)),
             pan_emitter: openlogi_agent_core::hook_runtime::PanEmitter::new(),
+            gesture_coordinator:
+                openlogi_agent_core::gesture_coordinator::GestureCoordinator::default(),
             capture_epoch: CaptureEpoch::default(),
             receiver_access: ReceiverAccess::default(),
         }

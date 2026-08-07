@@ -10,6 +10,7 @@ pub mod bindings;
 pub mod device_order;
 mod dpi;
 pub mod event_monitor;
+pub mod gesture_coordinator;
 pub mod hardware;
 pub mod hook_runtime;
 pub mod ipc;
