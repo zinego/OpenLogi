@@ -18,7 +18,10 @@ also consumed on load: its active typed binding is retained and dormant
 gesture/Pan maps in both global and per-application bindings are reduced to
 their click action (or the button's native default). A disabled or
 non-dedicated legacy owner also records the dedicated gesture button as a
-single action so the schema-4 default cannot reactivate it.
+single action so the schema-4 default cannot reactivate it. Missing or invalid
+owners use the legacy inference order before normalization: the first ordinary
+Gesture binding, then an explicit dedicated Single as Off, otherwise the
+implicit dedicated owner. Pan bindings never participate in that inference.
 
 Per-device settings are keyed by the HID++ identifier (e.g. `2b042` for an
 MX Master 4):

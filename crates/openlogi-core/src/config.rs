@@ -1314,12 +1314,7 @@ click = "Paste"
     #[test]
     fn gesture_owner_legacy_non_dedicated_state_materializes_inactive_gesture_button() {
         for schema_version in [2, 3] {
-            for owner_line in [
-                "gesture_owner = \"Off\"",
-                "gesture_owner = \"Forward\"",
-                "gesture_owner = \"bogus\"",
-                "",
-            ] {
+            for owner_line in ["gesture_owner = \"Off\"", "gesture_owner = \"Forward\""] {
                 let legacy = format!(
                     r#"
 schema_version = {schema_version}
@@ -1409,20 +1404,50 @@ Up = "MissionControl"
     }
 
     #[test]
-    fn gesture_owner_schema_v3_invalid_or_missing_demotes_to_native_defaults() {
-        for owner_line in ["gesture_owner = \"bogus\"", ""] {
-            let legacy = format!(
-                r#"
-schema_version = 3
+    fn gesture_owner_legacy_missing_or_invalid_with_ordinary_bindings_infers_dedicated() {
+        for schema_version in [2, 3] {
+            for owner_line in ["gesture_owner = \"bogus\"", ""] {
+                let legacy = format!(
+                    r#"
+schema_version = {schema_version}
 
 [devices.mouse]
 {owner_line}
 
-[devices.mouse.bindings.Forward]
-Left = "PreviousDesktop"
+[devices.mouse.bindings]
+Back = "BrowserBack"
+"#
+                );
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().join("config.toml");
+                fs::write(&path, legacy).expect("write legacy config");
+
+                let bindings = Config::load_from_path(&path)
+                    .expect("invalid or missing owner must not fail the load")
+                    .bindings_for("mouse");
+                assert_eq!(bindings.get(&ButtonId::GestureButton), None);
+                assert_eq!(
+                    bindings.get(&ButtonId::Back),
+                    Some(&Binding::Single(Action::BrowserBack))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gesture_owner_legacy_missing_infers_first_os_gesture_binding() {
+        for schema_version in [2, 3] {
+            let legacy = format!(
+                r#"
+schema_version = {schema_version}
 
 [devices.mouse.bindings.Back]
+Click = "BrowserBack"
 Up = "MissionControl"
+
+[devices.mouse.bindings.Forward]
+Click = "BrowserForward"
+Left = "PreviousDesktop"
 "#
             );
             let dir = tempfile::tempdir().expect("tempdir");
@@ -1430,15 +1455,77 @@ Up = "MissionControl"
             fs::write(&path, legacy).expect("write legacy config");
 
             let bindings = Config::load_from_path(&path)
-                .expect("invalid or missing owner must not fail the load")
+                .expect("load legacy config")
                 .bindings_for("mouse");
+            assert!(matches!(
+                bindings.get(&ButtonId::Back),
+                Some(Binding::Gesture(_))
+            ));
             assert_eq!(
                 bindings.get(&ButtonId::Forward),
-                Some(&Binding::Single(default_binding(ButtonId::Forward)))
+                Some(&Binding::Single(Action::BrowserForward))
             );
             assert_eq!(
-                bindings.get(&ButtonId::Back),
-                Some(&Binding::Single(default_binding(ButtonId::Back)))
+                bindings.get(&ButtonId::GestureButton),
+                Some(&Binding::Single(default_binding(ButtonId::GestureButton)))
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_owner_legacy_gesture_button_single_infers_off() {
+        for schema_version in [2, 3] {
+            let legacy = format!(
+                r#"
+schema_version = {schema_version}
+
+[devices.mouse.bindings]
+GestureButton = "MissionControl"
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, legacy).expect("write legacy config");
+
+            let bindings = Config::load_from_path(&path)
+                .expect("load legacy config")
+                .bindings_for("mouse");
+            assert_eq!(
+                bindings.get(&ButtonId::GestureButton),
+                Some(&Binding::Single(Action::MissionControl))
+            );
+            assert_eq!(
+                bindings.get(&ButtonId::Forward),
+                Some(&Binding::Single(Action::SmartZoom))
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_owner_legacy_pan_only_does_not_take_inferred_ownership() {
+        for schema_version in [2, 3] {
+            let legacy = format!(
+                r#"
+schema_version = {schema_version}
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, legacy).expect("write legacy config");
+
+            let bindings = Config::load_from_path(&path)
+                .expect("load legacy config")
+                .bindings_for("mouse");
+            assert_eq!(bindings.get(&ButtonId::GestureButton), None);
+            assert_eq!(
+                bindings.get(&ButtonId::Forward),
+                Some(&Binding::Single(Action::SmartZoom))
             );
         }
     }

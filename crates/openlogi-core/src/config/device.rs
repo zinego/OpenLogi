@@ -218,20 +218,40 @@ fn decode_legacy_gesture_owner(value: Option<&toml::Value>) -> Option<LegacyGest
     button.map(LegacyGestureOwner::Button)
 }
 
+fn resolve_legacy_gesture_owner(
+    value: Option<&toml::Value>,
+    bindings: &BTreeMap<ButtonId, Binding>,
+) -> LegacyGestureOwner {
+    if let Some(owner) = decode_legacy_gesture_owner(value) {
+        return owner;
+    }
+    if let Some((button, _)) = bindings
+        .iter()
+        .find(|(button, binding)| **button != ButtonId::GestureButton && binding.is_gesture())
+    {
+        return LegacyGestureOwner::Button(*button);
+    }
+    if matches!(
+        bindings.get(&ButtonId::GestureButton),
+        Some(Binding::Single(_))
+    ) {
+        return LegacyGestureOwner::Off;
+    }
+    LegacyGestureOwner::Button(ButtonId::GestureButton)
+}
+
 impl DeviceConfig {
     /// Consume schema-v2/v3's single-owner state without activating gesture
     /// maps that were dormant in those schemas.
     pub(super) fn normalize_legacy_gesture_owner(&mut self) {
-        let owner = decode_legacy_gesture_owner(self.raw_legacy_gesture_owner.as_ref());
+        let owner =
+            resolve_legacy_gesture_owner(self.raw_legacy_gesture_owner.as_ref(), &self.bindings);
         self.raw_legacy_gesture_owner = None;
         normalize_legacy_bindings(&mut self.bindings, owner);
         for overlay in self.per_app_bindings.values_mut() {
             normalize_legacy_bindings(overlay, owner);
         }
-        let dedicated_owner = matches!(
-            owner,
-            Some(LegacyGestureOwner::Button(ButtonId::GestureButton))
-        );
+        let dedicated_owner = matches!(owner, LegacyGestureOwner::Button(ButtonId::GestureButton));
         if !dedicated_owner {
             self.bindings
                 .entry(ButtonId::GestureButton)
@@ -242,12 +262,12 @@ impl DeviceConfig {
 
 fn normalize_legacy_bindings(
     bindings: &mut BTreeMap<ButtonId, Binding>,
-    owner: Option<LegacyGestureOwner>,
+    owner: LegacyGestureOwner,
 ) {
     for (button, binding) in bindings {
         let active = matches!(
             owner,
-            Some(LegacyGestureOwner::Button(owner_button)) if owner_button == *button
+            LegacyGestureOwner::Button(owner_button) if owner_button == *button
         );
         if (binding.is_gesture() || binding.is_pan()) && !active {
             let click = match binding {
