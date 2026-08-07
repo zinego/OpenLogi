@@ -24,11 +24,13 @@ Mission Control at the same time. The GUI and the physical mouse behavior must a
 all effective per-button Gesture/Pan bindings rather than filtering through one `gesture_owner`.
 Per-app bindings continue to replace the whole button binding.
 
-Existing schema-v3 files remain readable. A legacy explicit `gesture_owner` is used only to preserve
-the previously active binding while loading/migrating; it must not suppress another button whose
-stored binding is Gesture/Pan. New writes omit the obsolete owner field once migration is complete.
-Ordinary button mappings are never silently promoted except for the explicit M650 test configuration
-chosen by the user.
+Existing schema-v3 files remain readable. One-time normalization consumes a legacy explicit
+`gesture_owner`: its selected button keeps its Gesture/Pan binding, while dormant Gesture/Pan maps on
+non-owners are demoted to `Single` using their Click action (or the button's native default when Click
+is absent). `Off` demotes every dormant map. This preserves the behavior that was live before upgrade
+without accidentally activating previously hidden gesture maps. New writes omit the obsolete owner
+field once normalization completes. Ordinary button mappings are never silently promoted except for
+the explicit M650 test configuration chosen by the user.
 
 ## Runtime and physical input
 
