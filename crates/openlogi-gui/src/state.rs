@@ -49,8 +49,8 @@ use load::LazyDeviceData;
 use crate::asset::AssetResolver;
 use crate::data::mouse_buttons::{Action, Binding, ButtonId, GestureDirection, default_binding};
 use crate::gesture_presets::{
-    GesturePreset, apply_binding_to_scope, binding_for_gesture_selection,
-    gesture_binding_with_direction, pan_binding_with_click,
+    GesturePreset, apply_binding_to_scope, binding_for_gesture_direction_selection,
+    binding_for_gesture_selection, binding_for_pan_click_selection,
 };
 use crate::state::devices::{
     adopt_transient_record, build_device_list, direct_key_prefix, pick_initial_device,
@@ -1415,15 +1415,15 @@ impl AppState {
         let Some(binding) = self.current_complete_binding(button) else {
             return;
         };
-        if !binding.is_pan() {
+        let Some(binding) = binding_for_pan_click_selection(&binding, action) else {
             return;
-        }
-        self.commit_complete_binding(button, pan_binding_with_click(&binding, action));
+        };
+        self.commit_complete_binding(button, binding);
     }
 
-    /// Update a single gesture-button sub-binding in memory, on disk, and in the
-    /// shared gesture map the watcher thread reads.
-    pub fn commit_gesture_binding(
+    /// Update one directional action only while `button` is still in Gesture
+    /// mode. Delayed callbacks after switching to Single/Pan are ignored.
+    pub fn commit_gesture_direction(
         &mut self,
         button: ButtonId,
         direction: GestureDirection,
@@ -1433,10 +1433,17 @@ impl AppState {
             debug!(?direction, "no active gesture binding — edit ignored");
             return;
         };
-        self.commit_complete_binding(
-            button,
-            gesture_binding_with_direction(&current, direction, action),
-        );
+        let Some(binding) =
+            binding_for_gesture_direction_selection(&current, button, direction, action)
+        else {
+            debug!(
+                ?button,
+                ?direction,
+                "stale or selected gesture edit ignored"
+            );
+            return;
+        };
+        self.commit_complete_binding(button, binding);
     }
 }
 

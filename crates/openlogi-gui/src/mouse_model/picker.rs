@@ -28,7 +28,10 @@ use gpui_component::{Icon, IconName, h_flex, popover::PopoverState, v_flex};
 use crate::data::mouse_buttons::{
     Action, Binding, ButtonId, Category, GestureDirection, default_gesture_binding,
 };
-use crate::gesture_presets::{GesturePreset, available_gesture_presets, classify_gesture_preset};
+use crate::gesture_presets::{
+    GesturePreset, available_gesture_presets, classify_gesture_preset, gesture_display_action,
+    selected_single_action,
+};
 use crate::mouse_model::view::MouseModelView;
 use crate::state::AppState;
 use crate::theme::{self, ACCENT_BLUE, Palette, SelectableStyle, Typography as _};
@@ -125,7 +128,7 @@ pub fn gesture_overview(
                 .child(if is_pan {
                     pan_card(&binding, view, active, pal)
                 } else {
-                    plus_card(&binding, view, active, pal)
+                    plus_card(button, &binding, view, active, pal)
                 })
                 // The flyout card only appears once a direction is activated.
                 .when_some(active, |row, dir| {
@@ -325,6 +328,7 @@ fn menu_card(pal: Palette) -> gpui::Div {
 /// action; the `active` cell (if any) is accented. Clicking a cell activates
 /// that direction (flying out the level-2 card) without committing.
 fn plus_card(
+    button: ButtonId,
     binding: &Binding,
     view: &Entity<MouseModelView>,
     active: Option<GestureDirection>,
@@ -333,10 +337,7 @@ fn plus_card(
     let actions: BTreeMap<GestureDirection, Action> = GestureDirection::ALL
         .into_iter()
         .map(|d| {
-            let action = binding
-                .direction_action(d)
-                .cloned()
-                .unwrap_or_else(|| default_gesture_binding(d));
+            let action = gesture_display_action(button, binding, d);
             (d, action)
         })
         .collect();
@@ -440,15 +441,12 @@ fn flyout_card(
     view: &Entity<MouseModelView>,
     pal: Palette,
 ) -> AnyElement {
-    let current = binding
-        .direction_action(dir)
-        .cloned()
-        .unwrap_or_else(|| default_gesture_binding(dir));
+    let current = gesture_display_action(button, binding, dir);
 
     let view_pick = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
         cx.update_global::<AppState, _>(|state, _| {
-            state.commit_gesture_binding(button, dir, action);
+            state.commit_gesture_direction(button, dir, action);
         });
         // Stay open; re-render so the level-1 cell + checkmark update.
         view_pick.update(cx, |_, vcx| vcx.notify());
@@ -518,7 +516,7 @@ fn single_action_card(
     view: &Entity<MouseModelView>,
     pal: Palette,
 ) -> AnyElement {
-    let current = binding.click_action();
+    let current = selected_single_action(binding);
     let view = view.clone();
     let on_pick: PickFn = Rc::new(move |action, _window, cx| {
         cx.update_global::<AppState, _>(|state, _| state.commit_binding(button, action));
@@ -536,7 +534,7 @@ fn single_action_card(
         .child(divider(pal))
         .child(scroll_list(
             "single-action-scroll",
-            action_rows("single-action-item", Some(&current), &on_pick, pal),
+            action_rows("single-action-item", current.as_ref(), &on_pick, pal),
         ))
         .into_any_element()
 }
@@ -622,9 +620,10 @@ pub(crate) fn action_icon_path(action: &Action) -> &'static str {
 }
 
 /// Build the category-grouped action rows. Each row leads with the action's
-/// icon, then its label; `current` adds a trailing accent check. Clicking any
-/// row invokes `on_pick`. `id_prefix` disambiguates element IDs between pickers
-/// that share this builder.
+/// icon, then its label; `current` adds a trailing accent check. Clicking an
+/// unselected row invokes `on_pick`; the selected row is deliberately inert so
+/// it cannot trigger a redundant persist/reload. `id_prefix` disambiguates
+/// element IDs between pickers that share this builder.
 fn action_rows(
     id_prefix: &'static str,
     current: Option<&Action>,
@@ -669,7 +668,11 @@ fn action_rows(
                                 .text_color(rgb(ACCENT_BLUE)),
                         )
                     })
-                    .on_click(move |_event, window, cx| (on_pick)(action.clone(), window, cx))
+                    .when(!selected, |row| {
+                        row.on_click(move |_event, window, cx| {
+                            (on_pick)(action.clone(), window, cx);
+                        })
+                    })
                     .into_any_element(),
             );
         }

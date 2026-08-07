@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use openlogi_core::binding::{
-    Action, Binding, ButtonId, GestureDirection, PanBinding, default_gesture_binding,
-    default_pan_binding, window_navigation_binding,
+    Action, Binding, ButtonId, GestureDirection, PanBinding, default_binding,
+    default_gesture_binding, default_pan_binding, window_navigation_binding,
 };
 use openlogi_core::config::Config;
 
@@ -85,6 +85,39 @@ pub(crate) fn pan_binding_with_click(binding: &Binding, click: Action) -> Bindin
     }
 }
 
+/// Resolve the action the GUI should display for one directional cell using
+/// the same sparse-map fallback as the corresponding runtime input path.
+#[must_use]
+pub(crate) fn gesture_display_action(
+    button: ButtonId,
+    binding: &Binding,
+    direction: GestureDirection,
+) -> Action {
+    let Binding::Gesture(map) = binding else {
+        return binding.click_action();
+    };
+    map.get(&direction).cloned().unwrap_or_else(|| {
+        if button == ButtonId::GestureButton {
+            default_gesture_binding(direction)
+        } else {
+            map.get(&GestureDirection::Click)
+                .cloned()
+                .unwrap_or_else(|| default_binding(button))
+        }
+    })
+}
+
+/// Return the action checkmarked in the ordinary-action card. Gesture/Pan
+/// click fallbacks are intentionally not selected because choosing any row
+/// converts the whole binding to [`Binding::Single`].
+#[must_use]
+pub(crate) fn selected_single_action(binding: &Binding) -> Option<Action> {
+    match binding {
+        Binding::Single(action) => Some(action.clone()),
+        Binding::Gesture(_) | Binding::Pan(_) => None,
+    }
+}
+
 /// Store one complete binding in the selected scope. Keeping this as one
 /// mutation prevents preset application from exposing partial direction maps.
 pub(crate) fn apply_binding_to_scope(
@@ -149,9 +182,137 @@ pub(crate) fn gesture_binding_with_direction(
     Binding::Gesture(map)
 }
 
+/// Resolve a direction-row choice to one whole-binding mutation. Stale
+/// callbacks after leaving Gesture mode and a click on the checkmarked row are
+/// both no-ops, so neither can persist or reload configuration.
+#[must_use]
+pub(crate) fn binding_for_gesture_direction_selection(
+    current: &Binding,
+    button: ButtonId,
+    direction: GestureDirection,
+    action: Action,
+) -> Option<Binding> {
+    if !matches!(current, Binding::Gesture(_))
+        || gesture_display_action(button, current, direction) == action
+    {
+        return None;
+    }
+    Some(gesture_binding_with_direction(current, direction, action))
+}
+
+/// Resolve a Pan click-row choice to one whole-binding mutation. A stale
+/// callback or the already-selected click action produces no mutation.
+#[must_use]
+pub(crate) fn binding_for_pan_click_selection(
+    current: &Binding,
+    action: Action,
+) -> Option<Binding> {
+    match current {
+        Binding::Pan(pan) if pan.click != action => Some(pan_binding_with_click(current, action)),
+        Binding::Single(_) | Binding::Gesture(_) | Binding::Pan(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_os_hook_gesture_display_uses_click_then_native_fallback() {
+        let back = Binding::Gesture(BTreeMap::from([(GestureDirection::Click, Action::Copy)]));
+        assert_eq!(
+            gesture_display_action(ButtonId::Back, &back, GestureDirection::Right),
+            Action::Copy
+        );
+
+        let forward = Binding::Gesture(BTreeMap::from([(GestureDirection::Left, Action::Paste)]));
+        assert_eq!(
+            gesture_display_action(ButtonId::Forward, &forward, GestureDirection::Right),
+            default_binding(ButtonId::Forward)
+        );
+        assert_eq!(
+            gesture_display_action(ButtonId::Forward, &forward, GestureDirection::Click),
+            default_binding(ButtonId::Forward)
+        );
+    }
+
+    #[test]
+    fn sparse_dedicated_gesture_display_uses_seeded_direction_defaults() {
+        let binding = Binding::Gesture(BTreeMap::from([(GestureDirection::Left, Action::Copy)]));
+
+        assert_eq!(
+            gesture_display_action(ButtonId::GestureButton, &binding, GestureDirection::Right),
+            default_gesture_binding(GestureDirection::Right)
+        );
+        assert_eq!(
+            gesture_display_action(ButtonId::GestureButton, &binding, GestureDirection::Click),
+            default_gesture_binding(GestureDirection::Click)
+        );
+    }
+
+    #[test]
+    fn stale_direction_edits_after_mode_change_produce_no_mutation() {
+        assert_eq!(
+            binding_for_gesture_direction_selection(
+                &Binding::Single(Action::MouseBack),
+                ButtonId::Back,
+                GestureDirection::Left,
+                Action::Copy,
+            ),
+            None
+        );
+        assert_eq!(
+            binding_for_gesture_direction_selection(
+                &default_pan_binding(),
+                ButtonId::Back,
+                GestureDirection::Left,
+                Action::Copy,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_direction_rows_produce_no_mutation() {
+        let current = Binding::Gesture(BTreeMap::from([(GestureDirection::Left, Action::Copy)]));
+        assert_eq!(
+            binding_for_gesture_direction_selection(
+                &current,
+                ButtonId::Back,
+                GestureDirection::Left,
+                Action::Copy,
+            ),
+            None
+        );
+        let sparse = Binding::Gesture(BTreeMap::from([(GestureDirection::Click, Action::Copy)]));
+        assert_eq!(
+            binding_for_gesture_direction_selection(
+                &sparse,
+                ButtonId::Back,
+                GestureDirection::Right,
+                Action::Copy,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_pan_click_produces_no_mutation() {
+        assert_eq!(
+            binding_for_pan_click_selection(&default_pan_binding(), Action::SmartZoom),
+            None
+        );
+    }
+
+    #[test]
+    fn only_single_bindings_mark_an_ordinary_action_selected() {
+        assert_eq!(
+            selected_single_action(&Binding::Single(Action::Copy)),
+            Some(Action::Copy)
+        );
+        assert_eq!(selected_single_action(&default_pan_binding()), None);
+        assert_eq!(selected_single_action(&window_navigation_binding()), None);
+    }
 
     #[test]
     fn classifies_complete_bindings_independently() {
@@ -349,11 +510,14 @@ mod tests {
 
     #[test]
     fn direction_edit_preserves_other_arms_and_becomes_custom() {
-        let edited = gesture_binding_with_direction(
+        let Some(edited) = binding_for_gesture_direction_selection(
             &window_navigation_binding(),
+            ButtonId::Back,
             GestureDirection::Left,
             Action::Copy,
-        );
+        ) else {
+            panic!("a changed direction must produce a complete binding");
+        };
         assert_eq!(classify_gesture_preset(&edited), GesturePreset::Custom);
         assert_eq!(
             edited.direction_action(GestureDirection::Left),
@@ -368,10 +532,10 @@ mod tests {
     #[test]
     fn pan_click_edit_preserves_pan_mode() {
         assert_eq!(
-            pan_binding_with_click(&default_pan_binding(), Action::MissionControl),
-            Binding::Pan(PanBinding {
+            binding_for_pan_click_selection(&default_pan_binding(), Action::MissionControl),
+            Some(Binding::Pan(PanBinding {
                 click: Action::MissionControl,
-            })
+            }))
         );
     }
 
