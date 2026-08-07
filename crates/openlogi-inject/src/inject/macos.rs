@@ -285,38 +285,36 @@ fn post_media_key(nx_key: i32) {
     });
 }
 
-/// Post AppKit's native Smart Magnify gesture at the current pointer location.
+/// Post CoreGraphics' Smart Magnify gesture at the current pointer location.
 fn post_smart_magnify() {
-    use objc2::rc::autoreleasepool;
-    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
-    use objc2_core_graphics::{CGEvent, CGEventField, CGEventTapLocation};
+    use objc2_core_graphics::{CGEvent as RawCGEvent, CGEventTapLocation};
 
-    autoreleasepool(|_| {
-        let Some(ns_event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-            NSEventType(super::smart_magnify_event_type()),
-            NSEvent::mouseLocation(),
-            NSEventModifierFlags::empty(),
-            0.0,
-            0,
-            None,
-            0,
-            0,
-            0,
-        ) else {
-            tracing::warn!("NSEvent::otherEventWithType failed for Smart Magnify");
-            return;
-        };
-        let Some(cg_event) = ns_event.CGEvent() else {
-            tracing::warn!("NSEvent::CGEvent failed for Smart Magnify");
-            return;
-        };
-        CGEvent::set_integer_value_field(
-            Some(&cg_event),
-            CGEventField::EventSourceUserData,
-            super::SYNTHETIC_EVENT_USER_DATA,
-        );
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&cg_event));
-    });
+    let Some(event) = new_smart_magnify_event() else {
+        tracing::warn!("CGEvent creation failed for Smart Magnify");
+        return;
+    };
+    RawCGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+}
+
+/// Construct, position, and stamp a Smart Magnify event without posting it.
+fn new_smart_magnify_event() -> Option<impl std::ops::Deref<Target = objc2_core_graphics::CGEvent>>
+{
+    use objc2_core_graphics::{
+        CGEvent as RawCGEvent, CGEventField, CGEventSource as RawCGEventSource,
+        CGEventSourceStateID, CGEventType,
+    };
+
+    let source = RawCGEventSource::new(CGEventSourceStateID::HIDSystemState)?;
+    let event = RawCGEvent::new(Some(&source))?;
+    let cursor = RawCGEvent::location(Some(&event));
+    RawCGEvent::set_location(Some(&event), cursor);
+    RawCGEvent::set_type(Some(&event), CGEventType(super::smart_magnify_event_type()));
+    RawCGEvent::set_integer_value_field(
+        Some(&event),
+        CGEventField::EventSourceUserData,
+        super::SYNTHETIC_EVENT_USER_DATA,
+    );
+    Some(event)
 }
 
 /// Post a synthetic scroll event for `action` (one of the `Scroll*` variants).
@@ -621,5 +619,19 @@ mod symbolic_hotkey {
                 ),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new_smart_magnify_event;
+    use objc2_core_graphics::CGEvent;
+
+    #[test]
+    fn smart_magnify_event_is_constructible_without_posting() {
+        let Some(event) = new_smart_magnify_event() else {
+            panic!("CoreGraphics must construct a Smart Magnify event");
+        };
+        assert_eq!(CGEvent::r#type(Some(&event)).0, 32);
     }
 }

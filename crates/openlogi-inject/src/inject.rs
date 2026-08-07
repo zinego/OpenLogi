@@ -120,11 +120,13 @@ pub fn post_pan_scroll(delta_x: i32, delta_y: i32) {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PanScrollUnit {
     Pixel,
 }
 
+#[cfg(any(target_os = "macos", test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PanScrollEvent {
     unit: PanScrollUnit,
@@ -132,6 +134,7 @@ struct PanScrollEvent {
     horizontal: i32,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn pan_scroll_event(delta_x: i32, delta_y: i32) -> Option<PanScrollEvent> {
     (delta_x != 0 || delta_y != 0).then(|| PanScrollEvent {
         unit: PanScrollUnit::Pixel,
@@ -140,7 +143,8 @@ fn pan_scroll_event(delta_x: i32, delta_y: i32) -> Option<PanScrollEvent> {
     })
 }
 
-const fn smart_magnify_event_type() -> usize {
+#[cfg(any(target_os = "macos", test))]
+const fn smart_magnify_event_type() -> u32 {
     32
 }
 
