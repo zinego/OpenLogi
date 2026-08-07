@@ -1,11 +1,9 @@
 //! App-wide and per-device *value* settings: [`AppSettings`], [`Appearance`],
 //! [`Lighting`], [`ScrollResolution`], [`WheelMode`] / [`SmartShift`], and
-//! [`GestureOwner`], plus
 //! their serde `default_*` / `deserialize_*` helpers.
 
 use serde::{Deserialize, Serialize};
 
-use crate::binding::ButtonId;
 use crate::color::Rgb;
 
 /// Light/dark appearance preference. `System` follows the OS appearance (the
@@ -355,59 +353,6 @@ pub struct SmartShift {
     /// Tunable-torque force percentage (`1`–`100`), `0` when the device
     /// doesn't support tunable torque.
     pub tunable_torque: u8,
-}
-
-/// Which control owns a device's single gesture role.
-///
-/// Stored explicitly — rather than inferred from which button happens to carry a
-/// [`Binding::Gesture`](crate::binding::Binding::Gesture) — so switching the
-/// gesture button never has to collapse a button's gesture map to encode the
-/// choice: every gesture-capable button keeps its full direction map, and only
-/// the owner is dispatched. Serialized as a bare string (`"Off"` or a
-/// [`ButtonId`] name) so it stays a TOML scalar.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GestureOwner {
-    /// Gestures are explicitly turned off for this device.
-    Off,
-    /// The named button owns the gesture role.
-    Button(ButtonId),
-}
-
-impl Serialize for GestureOwner {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            // "Off" can't collide with a ButtonId variant name (all CamelCase
-            // control names), so the string space is unambiguous.
-            GestureOwner::Off => serializer.serialize_str("Off"),
-            GestureOwner::Button(id) => id.serialize(serializer),
-        }
-    }
-}
-
-/// Lenient field deserializer for `RawDeviceConfig::gesture_owner`
-/// (`crate::config::device`). An unrecognized or miscased value (`"back"`, a
-/// typo, a future-version button name) is treated as absent — i.e. "infer the
-/// owner" — rather than failing the whole-document parse and reverting *every*
-/// device's settings to defaults. Mirrors [`deserialize_brightness`], which
-/// clamps a bad value instead of erroring; a hand-editable config should
-/// degrade one field, not the document.
-pub(super) fn deserialize_gesture_owner<'de, D>(
-    deserializer: D,
-) -> Result<Option<GestureOwner>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let s = String::deserialize(deserializer)?;
-    if s == "Off" {
-        return Ok(Some(GestureOwner::Off));
-    }
-    // Parse the button name with a throwaway error type so an unknown token maps
-    // to `None` (infer) rather than propagating an error.
-    let button = ButtonId::deserialize(
-        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&s),
-    )
-    .ok();
-    Ok(button.map(GestureOwner::Button))
 }
 
 #[cfg(test)]

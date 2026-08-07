@@ -1,15 +1,12 @@
-//! Per-device config: [`DeviceIdentity`], [`DeviceConfig`], and the
-//! [`RawDeviceConfig`] migration shim that folds pre-v2 files into the
-//! unified `bindings` map.
+//! Per-device config: [`DeviceIdentity`], [`DeviceConfig`], and private
+//! migration shims for legacy binding layouts.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::settings::{
-    GestureOwner, Lighting, ScrollResolution, SmartShift, deserialize_gesture_owner,
-};
-use crate::binding::{Action, Binding, ButtonId, GestureDirection};
+use super::settings::{Lighting, ScrollResolution, SmartShift};
+use crate::binding::{Action, Binding, ButtonId, GestureDirection, default_binding};
 use crate::device::{Capabilities, DeviceKind, DeviceModelInfo};
 
 /// Last-known identity of a device, captured while it was online so the UI can
@@ -49,19 +46,16 @@ pub struct DeviceIdentity {
 ///
 /// Deserialization goes through `RawDeviceConfig` (`#[serde(from)]`) so
 /// pre-v2 files — which split bindings across `button_bindings` +
-/// `gesture_bindings` — fold into the unified [`Self::bindings`] map. Only
-/// `bindings` is ever serialized, so a migrated file self-heals to the v2 shape
-/// on its next save.
+/// `gesture_bindings` — fold into the unified [`Self::bindings`] map. Only the
+/// current fields are serialized, so migrated files self-heal on their next
+/// save.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(from = "RawDeviceConfig")]
 pub struct DeviceConfig {
-    /// Which button owns the device's single gesture role, once the user has
-    /// chosen explicitly. Absent means "infer" (the dedicated HID++ gesture
-    /// button owns gestures if present) — see
-    /// [`Config::gesture_owner`](crate::config::Config::gesture_owner). Listed
-    /// first so it serializes as a scalar ahead of the `bindings` sub-table.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gesture_owner: Option<GestureOwner>,
+    /// Schema-v3 owner value retained only until top-level migration consumes
+    /// it. It is never serialized and is not part of the live config API.
+    #[serde(skip)]
+    legacy_gesture_owner: Option<LegacyGestureOwner>,
     /// Last-known identity (name / kind / capabilities), captured while the
     /// device was online. Lets the UI render this device — with the right
     /// config panels — on a cold start before any probe, or while it sleeps.
@@ -124,19 +118,14 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Deserialize-only shim that folds the pre-v2 `button_bindings` +
-/// `gesture_bindings` fields into [`DeviceConfig::bindings`]. Never serialized
-/// (only [`DeviceConfig`] is), so reading a legacy file and saving rewrites it
-/// in the v2 shape.
+/// Deserialize-only shim that folds pre-v2 binding fields and temporarily
+/// captures schema-v3 owner state. Never serialized (only [`DeviceConfig`] is).
 #[derive(Deserialize)]
 struct RawDeviceConfig {
-    /// Explicit gesture owner (v2.1+). Absent on older configs → `None` → the
-    /// owner is inferred in
-    /// [`Config::gesture_owner`](crate::config::Config::gesture_owner). A
-    /// present-but-invalid value is tolerated as `None` (infer), not a parse
-    /// error — see [`deserialize_gesture_owner`].
-    #[serde(default, deserialize_with = "deserialize_gesture_owner")]
-    gesture_owner: Option<GestureOwner>,
+    /// Schema-v3's explicit single owner. Invalid values remain field-local
+    /// and lenient: they decode as absent rather than rejecting the document.
+    #[serde(default, deserialize_with = "deserialize_legacy_gesture_owner")]
+    gesture_owner: Option<LegacyGestureOwner>,
     #[serde(default)]
     identity: Option<DeviceIdentity>,
     /// v2 shape — present on already-migrated files; wins on any key collision.
@@ -196,7 +185,7 @@ impl From<RawDeviceConfig> for DeviceConfig {
         }
 
         DeviceConfig {
-            gesture_owner: raw.gesture_owner,
+            legacy_gesture_owner: raw.gesture_owner,
             identity: raw.identity,
             bindings,
             per_app_bindings: raw.per_app_bindings,
@@ -206,6 +195,54 @@ impl From<RawDeviceConfig> for DeviceConfig {
             smartshift: raw.smartshift,
             invert_scroll: raw.invert_scroll,
             scroll_resolution: raw.scroll_resolution,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegacyGestureOwner {
+    Off,
+    Button(ButtonId),
+}
+
+fn deserialize_legacy_gesture_owner<'de, D>(
+    deserializer: D,
+) -> Result<Option<LegacyGestureOwner>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == "Off" {
+        return Ok(Some(LegacyGestureOwner::Off));
+    }
+    let button = ButtonId::deserialize(
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&value),
+    )
+    .ok();
+    Ok(button.map(LegacyGestureOwner::Button))
+}
+
+impl DeviceConfig {
+    /// Consume schema-v3's single-owner state without activating gesture maps
+    /// that were dormant in that schema.
+    pub(super) fn normalize_legacy_gesture_owner(&mut self) {
+        let owner = self.legacy_gesture_owner.take();
+        for (button, binding) in &mut self.bindings {
+            let active = matches!(
+                owner,
+                Some(LegacyGestureOwner::Button(owner_button)) if owner_button == *button
+            );
+            if (binding.is_gesture() || binding.is_pan()) && !active {
+                let click = match binding {
+                    Binding::Gesture(map) => map
+                        .get(&GestureDirection::Click)
+                        .cloned()
+                        .unwrap_or_else(|| default_binding(*button)),
+                    Binding::Pan(pan) => pan.click.clone(),
+                    Binding::Single(_) => continue,
+                };
+                *binding = Binding::Single(click);
+            }
         }
     }
 }

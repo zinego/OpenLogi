@@ -13,13 +13,16 @@ DPI / SmartShift / lighting panels), but the file stays hand-editable;
 per-application overlays and custom shortcuts are currently authored there.
 OpenLogi reloads it on startup. Older `schema_version = 1` files (separate
 `button_bindings` / `gesture_bindings` tables) are migrated to the unified
-`bindings` map on first load.
+`bindings` map on first load. Schema 3's device-wide `gesture_owner` is also
+consumed on load: its active typed binding is retained and dormant gesture/Pan
+maps are reduced to their click action (or the button's native default).
 
 Per-device settings are keyed by the HID++ identifier (e.g. `2b042` for an
 MX Master 4):
 
-- `bindings` — one entry per rebindable button: either a single action, or a
-  per-direction table for the gesture button.
+- `bindings` — one complete entry per rebindable button: a single action, a
+  per-direction gesture table, or a Pan binding. Multiple buttons can carry
+  different gesture/Pan bindings simultaneously.
 - `per_app_bindings` — overlays keyed by application id (bundle id such as
   `com.microsoft.VSCode` on macOS, `WM_CLASS` on Linux/X11, or a lower-cased
   executable path on Windows) that take precedence while that app is
@@ -30,8 +33,6 @@ MX Master 4):
   without changing the system trackpad direction.
 - `lighting` — static RGB colour, brightness (0–100), and on/off for wired
   RGB keyboards.
-- `gesture_owner` — which button owns the gesture role, when chosen
-  explicitly (otherwise inferred).
 
 The app-wide `[app_settings]` block holds `launch_at_login`,
 `check_for_updates`, and `auto_install_updates` (all off by default);
@@ -46,7 +47,7 @@ locale); `thumbwheel_sensitivity` (default `14`); and the `appearance` (default
 settings. The theme and radius overrides are absent by default.
 
 ```toml
-schema_version = 2
+schema_version = 4
 selected_device = "2b042"
 
 [app_settings]
@@ -66,17 +67,16 @@ appearance = "system"
 [devices.2b042]
 dpi_presets = [800, 1600, 3200]
 
-[devices.2b042.bindings]
-Back = "BrowserBack"
-Forward = "BrowserForward"
-
-# Gesture button: one action per swipe direction; Click = plain press.
-[devices.2b042.bindings.GestureButton]
+# Back uses Window Navigation while Forward independently uses Pan.
+[devices.2b042.bindings.Back]
 Click = "MissionControl"
 Up = "MissionControl"
 Down = "AppExpose"
 Left = "PreviousDesktop"
 Right = "NextDesktop"
+
+[devices.2b042.bindings.Forward.Pan]
+click = "SmartZoom"
 
 # Per-app overlay: Back becomes Undo only while VS Code is frontmost.
 [devices.2b042.per_app_bindings."com.microsoft.VSCode"]

@@ -21,10 +21,9 @@ mod settings;
 
 pub use device::{DeviceConfig, DeviceIdentity};
 pub use settings::{
-    AppSettings, Appearance, AssetSourcePreference, DEFAULT_THUMBWHEEL_SENSITIVITY, GestureOwner,
-    Lighting, MAX_THUMBWHEEL_SENSITIVITY, MIN_THUMBWHEEL_SENSITIVITY,
-    SMARTSHIFT_AUTO_DISENGAGE_DEFAULT, SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift,
-    WheelMode,
+    AppSettings, Appearance, AssetSourcePreference, DEFAULT_THUMBWHEEL_SENSITIVITY, Lighting,
+    MAX_THUMBWHEEL_SENSITIVITY, MIN_THUMBWHEEL_SENSITIVITY, SMARTSHIFT_AUTO_DISENGAGE_DEFAULT,
+    SMARTSHIFT_MIN_AUTO_DISENGAGE, ScrollResolution, SmartShift, WheelMode,
 };
 
 use crate::binding::{Action, Binding, ButtonId, GestureDirection, default_binding_for};
@@ -34,16 +33,20 @@ use crate::paths::{self, PathsError};
 /// changes; readers branch on the parsed value before consuming the rest of
 /// the file.
 ///
+/// v4 removes the device-wide gesture owner. Schema-v3 owner state is consumed
+/// once on load so only the previously active typed binding remains typed.
+///
 /// v3 changes the device map from model keys to physical-device keys. No v2
 /// device entries are migrated because model-scoped settings cannot be assigned
 /// safely when two identical devices exist.
 ///
 /// v2 merged the per-device `button_bindings` + `gesture_bindings` maps into a
 /// single `bindings: BTreeMap<ButtonId, Binding>`. A v1 file still loads (the
-/// `RawDeviceConfig` shim folds the legacy fields) and self-heals to v2 on the
-/// next save; [`Config::load_from_path`] rejects only versions *newer* than this
-/// so a forward file fails loudly instead of silently losing bindings.
-pub const SCHEMA_VERSION: u32 = 3;
+/// `RawDeviceConfig` shim folds the legacy fields) and self-heals to the current
+/// schema on the next save; [`Config::load_from_path`] rejects only versions
+/// *newer* than this so a forward file fails loudly instead of silently losing
+/// bindings.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Top-level config document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -162,9 +165,14 @@ impl Config {
                         found: config.schema_version,
                     });
                 }
+                if config.schema_version == 3 {
+                    for device in config.devices.values_mut() {
+                        device.normalize_legacy_gesture_owner();
+                    }
+                }
                 // Stamp the in-memory doc to the current version so a re-save
-                // writes the migrated v2 shape (the device shim already folded
-                // the legacy fields during deserialize).
+                // writes the current shape (the device shim already folded
+                // legacy fields during deserialize and v3 owner state above).
                 config.schema_version = SCHEMA_VERSION;
                 Ok(config)
             }
@@ -260,10 +268,7 @@ impl Config {
     /// Ensure `button` on `device_key` is a [`Binding::Gesture`], creating the
     /// device + a default binding if needed and upgrading a [`Binding::Single`]
     /// in place (its action kept as the [`GestureDirection::Click`]). Returns the
-    /// entry so the caller can finish it — seed every direction
-    /// ([`Binding::fill_gesture_defaults`]) or set just one. Shared by
-    /// [`Self::set_gesture_owner`] and [`Self::set_gesture_direction`] so the two
-    /// promote a button into gesture mode identically.
+    /// entry so the caller can finish setting one direction.
     fn ensure_gesture_binding(&mut self, device_key: &str, button: ButtonId) -> &mut Binding {
         let entry = self
             .devices
@@ -274,81 +279,6 @@ impl Config {
             .or_insert_with(|| default_binding_for(button));
         entry.upgrade_to_gesture();
         entry
-    }
-
-    /// The button that owns `device_key`'s single gesture role, or `None` when
-    /// gestures are turned off.
-    ///
-    /// Resolved from the explicit [`DeviceConfig::gesture_owner`] when present;
-    /// otherwise inferred (see `Self::infer_gesture_owner`) for configs
-    /// predating the field and freshly-migrated pre-v2 files. The dedicated
-    /// HID++ gesture button ([`ButtonId::GestureButton`]) owns the role by
-    /// default. At most one button gestures per device.
-    #[must_use]
-    pub fn gesture_owner(&self, device_key: &str) -> Option<ButtonId> {
-        let Some(device) = self.devices.get(device_key) else {
-            // No config yet → the dedicated HID++ gesture button is the default gesture owner.
-            return Some(ButtonId::GestureButton);
-        };
-        match device.gesture_owner {
-            Some(GestureOwner::Off) => None,
-            Some(GestureOwner::Button(id)) => Some(id),
-            None => Self::infer_gesture_owner(&device.bindings),
-        }
-    }
-
-    /// Infer the gesture owner for a config predating the explicit
-    /// [`DeviceConfig::gesture_owner`] field, from the shape of `bindings` — the
-    /// pre-field behavior, so old/migrated configs keep working until the first
-    /// explicit owner change stamps the field.
-    fn infer_gesture_owner(bindings: &BTreeMap<ButtonId, Binding>) -> Option<ButtonId> {
-        // An OS-hook button left in gesture mode took the role over.
-        if let Some((id, _)) = bindings
-            .iter()
-            .find(|(id, b)| **id != ButtonId::GestureButton && b.is_gesture())
-        {
-            return Some(*id);
-        }
-        // A dedicated HID++ gesture button explicitly demoted to a single action means gestures off.
-        if matches!(
-            bindings.get(&ButtonId::GestureButton),
-            Some(Binding::Single(_))
-        ) {
-            return None;
-        }
-        // Default: the dedicated HID++ gesture button owns the gesture role.
-        Some(ButtonId::GestureButton)
-    }
-
-    /// Make `button` the device's sole gesture button.
-    ///
-    /// Records `button` as the explicit [`gesture_owner`](Self::gesture_owner), so
-    /// the one-gesture-button-per-device lock is a data-model fact rather than a
-    /// destructive demotion of the others — every other gesture-capable button
-    /// keeps its own gesture map intact, ready to restore if re-chosen, and is
-    /// simply not dispatched while it isn't the owner. `button` is given a full
-    /// [`Binding::Gesture`] map: a prior [`Binding::Single`] is kept as the
-    /// [`GestureDirection::Click`] action, any existing swipe arms are preserved,
-    /// and unbound directions are seeded from
-    /// [`default_gesture_binding`](crate::binding::default_gesture_binding) so every
-    /// gesture button exposes the same full five-direction set.
-    pub fn set_gesture_owner(&mut self, device_key: &str, button: ButtonId) {
-        self.devices
-            .entry(device_key.to_string())
-            .or_default()
-            .gesture_owner = Some(GestureOwner::Button(button));
-        self.ensure_gesture_binding(device_key, button)
-            .fill_gesture_defaults();
-    }
-
-    /// Turn gestures off for `device_key`, recording the explicit "off" choice.
-    /// Every button keeps its gesture map intact (nothing is destroyed), so
-    /// re-selecting a gesture owner later restores its directions exactly.
-    pub fn disable_gestures(&mut self, device_key: &str) {
-        self.devices
-            .entry(device_key.to_string())
-            .or_default()
-            .gesture_owner = Some(GestureOwner::Off);
     }
 
     /// Resolve the effective binding map for `device_key`, overlaying the
@@ -591,7 +521,7 @@ mod tests {
     use std::assert_matches;
 
     use super::*;
-    use crate::binding::{default_binding, default_gesture_binding};
+    use crate::binding::default_binding;
 
     fn write_and_read(config: &Config) -> Config {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -844,7 +774,7 @@ mod tests {
         // The key only contains [A-Za-z0-9_], so TOML emits it as a bare-word
         // table key (no surrounding quotes). The test asserts the observable
         // structure rather than locking in a specific quoting.
-        assert!(body.contains("schema_version = 3"), "got: {body}");
+        assert!(body.contains("schema_version = 4"), "got: {body}");
         assert!(body.contains("[devices.2b042.bindings]"), "got: {body}");
         // A `Single` binding serializes byte-identically to the pre-v2 bare
         // `Action`, so the leaf line is unchanged.
@@ -1145,7 +1075,7 @@ Click = \"Paste\"
         // Saving self-heals to the current shape: stamped version + merged table,
         // legacy field names gone.
         let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(body.contains("schema_version = 3"), "got: {body}");
+        assert!(body.contains("schema_version = 4"), "got: {body}");
         assert!(body.contains("[devices.2b042.bindings]"), "got: {body}");
         assert!(!body.contains("button_bindings"), "got: {body}");
         assert!(!body.contains("gesture_bindings"), "got: {body}");
@@ -1286,190 +1216,174 @@ Back = \"BrowserBack\"
     }
 
     #[test]
-    fn gesture_owner_defaults_to_hidpp_button_yields_to_oshook_and_can_be_off() {
-        let mut cfg = Config::default();
-        // Default: the dedicated HID++ gesture button owns the gesture role even with no config.
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
+    fn gesture_owner_schema_v3_keeps_selected_pan_and_demotes_dormant_gesture() {
+        let legacy = r#"
+schema_version = 3
 
-        // A dedicated HID++ gesture binding keeps it the owner.
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::MissionControl,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
+[devices.mouse]
+gesture_owner = "Forward"
 
-        // An explicit OS-hook gesture button takes the role over.
-        cfg.set_binding(
-            "2b042",
-            ButtonId::Forward,
-            Binding::Gesture(BTreeMap::from([(GestureDirection::Up, Action::Copy)])),
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Forward));
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
 
-        // Turning gestures off explicitly yields `None` (not the HID++ button default).
-        let mut off = Config::default();
-        off.disable_gestures("2b042");
-        assert_eq!(off.gesture_owner("2b042"), None);
-    }
-
-    #[test]
-    fn set_gesture_owner_records_owner_without_destroying_other_maps() {
-        let mut cfg = Config::default();
-        // Customize the dedicated HID++ gesture button's Up swipe; it is the (inferred) owner.
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-
-        // Promote Back: the owner becomes Back explicitly; the HID++ gesture button keeps
-        // its full gesture map (no destructive demotion).
-        cfg.set_binding("2b042", ButtonId::Back, Action::BrowserBack.into());
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::Back));
-
-        let bindings = cfg.bindings_for("2b042");
-        // Back is a full five-direction gesture button: its prior single action
-        // stays as Click, and the swipe arms are seeded from defaults.
-        match bindings.get(&ButtonId::Back) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&Action::BrowserBack)
-                );
-                assert_eq!(
-                    map.get(&GestureDirection::Up),
-                    Some(&default_gesture_binding(GestureDirection::Up)),
-                    "a promoted button gets full default arms"
-                );
-            }
-            other => panic!("expected Back to be a gesture binding, got {other:?}"),
-        }
-        // The HID++ gesture button's customized map survived the switch intact.
-        match bindings.get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected the HID++ gesture button map preserved, got {other:?}"),
-        }
-
-        // Switching back restores the user's customization, not defaults
-        // (regression guard: owner-switch used to discard the swipe arms).
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected preserved gesture map, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn set_gesture_owner_seeds_a_fresh_button_with_full_directions() {
-        let mut cfg = Config::default();
-        // The dedicated HID++ gesture button gets the full default direction map.
-        cfg.set_gesture_owner("2b042", ButtonId::GestureButton);
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                for dir in GestureDirection::ALL {
-                    assert_eq!(map.get(&dir), Some(&default_gesture_binding(dir)));
-                }
-            }
-            other => panic!("expected full default gesture map, got {other:?}"),
-        }
-
-        // A fresh OS-hook button also gets all five directions, not just a Click:
-        // its native action stays as Click, and the swipe arms are defaults — so
-        // the GUI's shown defaults are exactly what the runtime dispatches.
-        cfg.set_gesture_owner("2b042", ButtonId::Forward);
-        match cfg.bindings_for("2b042").get(&ButtonId::Forward) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(
-                    map.get(&GestureDirection::Click),
-                    Some(&default_binding(ButtonId::Forward))
-                );
-                for dir in [
-                    GestureDirection::Up,
-                    GestureDirection::Down,
-                    GestureDirection::Left,
-                    GestureDirection::Right,
-                ] {
-                    assert_eq!(map.get(&dir), Some(&default_gesture_binding(dir)));
-                }
-            }
-            other => panic!("expected full gesture map for Forward, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn disable_gestures_turns_off_without_destroying_maps() {
-        let mut cfg = Config::default();
-        cfg.set_gesture_direction(
-            "2b042",
-            ButtonId::GestureButton,
-            GestureDirection::Up,
-            Action::Copy,
-        );
-        cfg.disable_gestures("2b042");
-        // Off, but the HID++ gesture button's customized map is preserved (re-enabling
-        // restores it rather than resurrecting a wiped default).
-        assert_eq!(cfg.gesture_owner("2b042"), None);
-        match cfg.bindings_for("2b042").get(&ButtonId::GestureButton) {
-            Some(Binding::Gesture(map)) => {
-                assert_eq!(map.get(&GestureDirection::Up), Some(&Action::Copy));
-            }
-            other => panic!("expected the gesture map preserved while off, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn gesture_owner_field_roundtrips_as_a_scalar() {
-        let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::Back); // explicit button
-        cfg.disable_gestures("4082d"); // explicit off
-
-        let parsed = write_and_read(&cfg);
-        assert_eq!(parsed.gesture_owner("2b042"), Some(ButtonId::Back));
-        assert_eq!(parsed.gesture_owner("4082d"), None);
-
-        // The custom codec keeps it a bare TOML string (a nested table would risk
-        // a value-after-table serialization error, since `bindings` is a table).
-        let body = toml::to_string_pretty(&cfg).expect("serialize");
-        assert!(body.contains("gesture_owner = \"Back\""), "got: {body}");
-        assert!(body.contains("gesture_owner = \"Off\""), "got: {body}");
-    }
-
-    #[test]
-    fn invalid_gesture_owner_string_is_tolerated_not_fatal() {
-        // A hand-edit typo in gesture_owner must NOT fail the whole-document parse
-        // (which would revert every device's settings to defaults). It degrades
-        // to "infer" while the rest of the device config survives.
-        let toml = "\
-schema_version = 2
-
-[devices.2b042]
-gesture_owner = \"bogus\"
-
-[devices.2b042.bindings]
-Back = \"Copy\"
-";
+[devices.mouse.bindings.Back]
+Click = "BrowserBack"
+Left = "PreviousDesktop"
+Right = "NextDesktop"
+"#;
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.toml");
-        fs::write(&path, toml).expect("write");
+        fs::write(&path, legacy).expect("write legacy config");
 
-        let cfg =
-            Config::load_from_path(&path).expect("an invalid gesture_owner must not fail the load");
-        // The rest of the device config survived...
+        let cfg = Config::load_from_path(&path).expect("load schema v3");
+        assert_eq!(cfg.schema_version, 4);
+        let bindings = cfg.bindings_for("mouse");
+        assert!(matches!(
+            bindings.get(&ButtonId::Forward),
+            Some(Binding::Pan(_))
+        ));
         assert_eq!(
-            cfg.bindings_for("2b042").get(&ButtonId::Back),
-            Some(&Binding::Single(Action::Copy))
+            bindings.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
         );
-        // ...and the bad owner degraded to inference (HID++ button default here).
-        assert_eq!(cfg.gesture_owner("2b042"), Some(ButtonId::GestureButton));
+
+        cfg.save_to_path(&path).expect("save schema v4");
+        let saved = fs::read_to_string(path).expect("read saved config");
+        assert!(!saved.contains("gesture_owner"), "got: {saved}");
+    }
+
+    #[test]
+    fn gesture_owner_schema_v3_off_demotes_every_typed_binding() {
+        let legacy = r#"
+schema_version = 3
+
+[devices.mouse]
+gesture_owner = "Off"
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.bindings.Back]
+Click = "BrowserBack"
+Up = "MissionControl"
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, legacy).expect("write legacy config");
+
+        let bindings = Config::load_from_path(&path)
+            .expect("load schema v3")
+            .bindings_for("mouse");
+        assert_eq!(
+            bindings.get(&ButtonId::Forward),
+            Some(&Binding::Single(Action::SmartZoom))
+        );
+        assert_eq!(
+            bindings.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
+        );
+    }
+
+    #[test]
+    fn gesture_owner_schema_v3_invalid_or_missing_demotes_to_native_defaults() {
+        for owner_line in ["gesture_owner = \"bogus\"", ""] {
+            let legacy = format!(
+                r#"
+schema_version = 3
+
+[devices.mouse]
+{owner_line}
+
+[devices.mouse.bindings.Forward]
+Left = "PreviousDesktop"
+
+[devices.mouse.bindings.Back]
+Up = "MissionControl"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, legacy).expect("write legacy config");
+
+            let bindings = Config::load_from_path(&path)
+                .expect("invalid or missing owner must not fail the load")
+                .bindings_for("mouse");
+            assert_eq!(
+                bindings.get(&ButtonId::Forward),
+                Some(&Binding::Single(default_binding(ButtonId::Forward)))
+            );
+            assert_eq!(
+                bindings.get(&ButtonId::Back),
+                Some(&Binding::Single(default_binding(ButtonId::Back)))
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_owner_schema_v3_absent_selected_binding_does_not_promote_it() {
+        let legacy = r#"
+schema_version = 3
+
+[devices.mouse]
+gesture_owner = "GestureButton"
+
+[devices.mouse.bindings.Back]
+Click = "BrowserBack"
+Up = "MissionControl"
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, legacy).expect("write legacy config");
+
+        let bindings = Config::load_from_path(&path)
+            .expect("load schema v3")
+            .bindings_for("mouse");
+        assert_eq!(bindings.get(&ButtonId::GestureButton), None);
+        assert_eq!(
+            bindings.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
+        );
+    }
+
+    #[test]
+    fn gesture_owner_schema_v4_roundtrips_independent_pan_and_gesture_bindings() {
+        let current = r#"
+schema_version = 4
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.bindings.Back]
+Click = "MissionControl"
+Up = "MissionControl"
+Down = "AppExpose"
+Left = "PreviousDesktop"
+Right = "NextDesktop"
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, current).expect("write schema v4 config");
+
+        let cfg = Config::load_from_path(&path).expect("load schema v4");
+        let bindings = cfg.bindings_for("mouse");
+        assert!(matches!(
+            bindings.get(&ButtonId::Forward),
+            Some(Binding::Pan(_))
+        ));
+        assert!(matches!(
+            bindings.get(&ButtonId::Back),
+            Some(Binding::Gesture(_))
+        ));
+
+        let restored = write_and_read(&cfg);
+        let restored_bindings = restored.bindings_for("mouse");
+        assert!(matches!(
+            restored_bindings.get(&ButtonId::Forward),
+            Some(Binding::Pan(_))
+        ));
+        assert!(matches!(
+            restored_bindings.get(&ButtonId::Back),
+            Some(Binding::Gesture(_))
+        ));
     }
 }
