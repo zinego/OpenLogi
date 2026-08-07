@@ -10,7 +10,8 @@
 //!
 //! The session is transport-only — it has no opinion on what an input *does*.
 //! In particular, it preserves the gesture button's raw press/motion/release
-//! lifecycle so orchestration can interpret it without HID transport policy.
+//! lifecycle so the agent watcher's [`openlogi_core::binding::SwipeAccumulator`]
+//! can interpret it without HID transport policy.
 //! The thumb wheel is special: diverting it stops native horizontal scroll, so
 //! the agent re-synthesises scroll from the [`CapturedInput::Scroll`] deltas —
 //! the wheel is therefore only diverted when the user's thumbwheel config

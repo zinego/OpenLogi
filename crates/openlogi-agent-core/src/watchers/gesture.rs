@@ -5,7 +5,9 @@
 //! ([`DpiCycleState::target`]), restarts it when the carousel selection — or the
 //! thumb-wheel arming — changes, and dispatches each captured input:
 //!
-//! - a gesture swipe through the gesture binding map,
+//! - the raw gesture-button lifecycle through a watcher-owned
+//!   [`openlogi_core::binding::SwipeAccumulator`], dispatching a configured
+//!   click or four-direction swipe through the gesture binding map,
 //! - a DPI/ModeShift or thumb-wheel-tap press through the button binding map,
 //! - thumb-wheel rotation through the [`ButtonId::ThumbwheelScrollUp`] /
 //!   [`ButtonId::ThumbwheelScrollDown`] bindings — either re-synthesised as
@@ -24,7 +26,9 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use openlogi_core::binding::{Action, ButtonId, GestureDirection, default_binding};
+use openlogi_core::binding::{
+    Action, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
+};
 use openlogi_core::config::DEFAULT_THUMBWHEEL_SENSITIVITY;
 use openlogi_hid::{CaptureChannel, CapturedInput, DeviceRoute, run_capture_session};
 use tokio::sync::{mpsc, oneshot};
@@ -34,8 +38,8 @@ use crate::DpiCycleState;
 use crate::hook_runtime::{self, SharedHookMaps};
 use crate::receiver_access::ReceiverAccess;
 
-/// Shared gesture-direction binding map, mirrored from `AppState` (keyed by
-/// direction). The watcher reads it to map a captured swipe to a bound action.
+/// Shared gesture binding map, mirrored from `AppState` (keyed by click/swipe
+/// direction). The watcher reads it after interpreting the raw HID lifecycle.
 pub type GestureBindings = Arc<RwLock<BTreeMap<GestureDirection, Action>>>;
 
 /// Shared thumb-wheel sensitivity, mirrored from `AppState`. Read on every wheel
@@ -157,7 +161,7 @@ async fn manage(
     let mut current: Option<(DeviceRoute, bool, bool)> = None;
     let mut stop: Option<oneshot::Sender<()>> = None;
     let mut ticker = tokio::time::interval(TARGET_POLL);
-    let mut accumulators = WheelAccumulators::default();
+    let mut dispatch_state = CaptureDispatchState::default();
     // Capture sessions run as detached tasks, so an unexpected exit (a transient
     // HID++ read error, a sleep-wake glitch, brief radio loss) would otherwise go
     // unnoticed: the tick below only restarts on a *changed* target, so a session
@@ -174,7 +178,7 @@ async fn manage(
             Some(input) = rx.recv() => {
                 dispatch(
                     input,
-                    &mut accumulators,
+                    &mut dispatch_state,
                     &hook_maps,
                     &gesture_bindings,
                     &dpi_cycle,
@@ -283,6 +287,13 @@ struct WheelAccumulators {
     down: WheelDirection,
 }
 
+/// Mutable input interpretation state owned by the capture watcher.
+#[derive(Default)]
+struct CaptureDispatchState {
+    gesture: SwipeAccumulator,
+    wheels: WheelAccumulators,
+}
+
 /// Running state for one rotation direction.
 #[derive(Default)]
 struct WheelDirection {
@@ -310,9 +321,9 @@ enum WheelOutput {
 /// Route one captured input to its bound action (or re-synthesised scroll).
 fn dispatch(
     input: CapturedInput,
-    accumulators: &mut WheelAccumulators,
+    state: &mut CaptureDispatchState,
     hook_maps: &SharedHookMaps,
-    _gesture_bindings: &GestureBindings,
+    gesture_bindings: &GestureBindings,
     dpi_cycle: &Arc<RwLock<DpiCycleState>>,
     capture: &CaptureChannel,
     thumbwheel_sensitivity: &ThumbwheelSensitivity,
@@ -322,8 +333,19 @@ fn dispatch(
         | CapturedInput::GestureMotion { .. }
         | CapturedInput::GestureReleased
         | CapturedInput::GestureCancelled => {
-            // The pan lifecycle is consumed here by the integration change.
-            debug!(?input, "raw HID++ gesture lifecycle not yet dispatched");
+            let Some(direction) = advance_gesture(&mut state.gesture, input) else {
+                return;
+            };
+            let action = gesture_bindings
+                .read()
+                .ok()
+                .and_then(|guard| guard.get(&direction).cloned());
+            if let Some(action) = action {
+                debug!(?direction, action = %action.label(), "gesture → action");
+                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+            } else {
+                debug!(?direction, "gesture with no binding — ignored");
+            }
         }
         CapturedInput::ButtonPressed(button) => {
             let action = hook_maps
@@ -352,9 +374,9 @@ fn dispatch(
                 .unwrap_or_else(|| default_binding(button));
             let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
             let dir = if up {
-                &mut accumulators.up
+                &mut state.wheels.up
             } else {
-                &mut accumulators.down
+                &mut state.wheels.down
             };
             let magnitude = i32::from(rotation).abs();
             match advance(dir, &action, magnitude, sensitivity, Instant::now()) {
@@ -368,6 +390,30 @@ fn dispatch(
                 }
             }
         }
+    }
+}
+
+/// Interpret one raw HID++ gesture event. Directional swipes commit once during
+/// motion; release produces a click only when no direction committed; cancel
+/// only resets the hold.
+fn advance_gesture(
+    gesture: &mut SwipeAccumulator,
+    input: CapturedInput,
+) -> Option<GestureDirection> {
+    match input {
+        CapturedInput::GesturePressed => {
+            gesture.begin();
+            None
+        }
+        CapturedInput::GestureMotion { delta_x, delta_y } => {
+            gesture.accumulate(i32::from(delta_x), i32::from(delta_y))
+        }
+        CapturedInput::GestureReleased => gesture.end().then_some(GestureDirection::Click),
+        CapturedInput::GestureCancelled => {
+            let _ = gesture.end();
+            None
+        }
+        CapturedInput::ButtonPressed(_) | CapturedInput::Scroll(_) => None,
     }
 }
 
@@ -441,6 +487,101 @@ fn advance(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gesture_quick_motion_releases_as_click() {
+        let mut gesture = SwipeAccumulator::default();
+
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
+            None
+        );
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                CapturedInput::GestureMotion {
+                    delta_x: 120,
+                    delta_y: 5,
+                }
+            ),
+            None,
+            "motion before the hold gate remains a click"
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
+            Some(GestureDirection::Click)
+        );
+    }
+
+    #[test]
+    fn gesture_motion_maps_all_four_directions_once() {
+        for (delta_x, delta_y, expected) in [
+            (120, 5, GestureDirection::Right),
+            (-120, 5, GestureDirection::Left),
+            (5, 120, GestureDirection::Down),
+            (5, -120, GestureDirection::Up),
+        ] {
+            let mut gesture = SwipeAccumulator::default();
+            assert_eq!(
+                advance_gesture(&mut gesture, CapturedInput::GesturePressed),
+                None
+            );
+            gesture.backdate_hold_for_test();
+            assert_eq!(
+                advance_gesture(
+                    &mut gesture,
+                    CapturedInput::GestureMotion { delta_x, delta_y }
+                ),
+                Some(expected)
+            );
+            assert_eq!(
+                advance_gesture(
+                    &mut gesture,
+                    CapturedInput::GestureMotion { delta_x, delta_y }
+                ),
+                None,
+                "a committed direction fires once"
+            );
+            assert_eq!(
+                advance_gesture(&mut gesture, CapturedInput::GestureReleased),
+                None,
+                "a committed swipe does not also click"
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_release_and_cancel_reset_without_phantom_clicks() {
+        let mut gesture = SwipeAccumulator::default();
+
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
+            None,
+            "a stray release is not a click"
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
+            None
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GestureCancelled),
+            None
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
+            None,
+            "release after cancellation is not a click"
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
+            None
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
+            Some(GestureDirection::Click),
+            "cancellation resets the accumulator for the next hold"
+        );
+    }
 
     #[test]
     fn multiplier_is_unity_at_default_sensitivity() {
