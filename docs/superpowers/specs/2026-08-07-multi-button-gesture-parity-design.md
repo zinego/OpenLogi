@@ -50,18 +50,39 @@ the explicit M650 test configuration chosen by the user.
 
 ## Runtime and physical input
 
-The OS-hook projection includes every Middle/Back/Forward effective Gesture/Pan binding. The HID++
-projection independently reads the dedicated gesture button. Pointer motion accepts MouseMoved and
-all dragged event types. Physical verification must record the actual M650 button-down, motion delta,
-and button-up chain; synthetic CGEvent success alone is insufficient evidence.
+The M650 exposes its reprogrammable controls through HID++ feature `0x1b04`. Runtime capability
+discovery identifies Middle as CID `0x0052`, Back as CID `0x0053`, and Forward as CID `0x0056`.
+The acceptance mouse reports Back and Forward with flags `0x0d31`, which include temporary diversion
+and raw XY. OpenLogi therefore treats HID++ diversion plus raw XY as the authoritative Back/Forward
+gesture path on this device. It never assumes that a delayed macOS side-button event establishes the
+physical hold: the observed M650 event tap emits the Back/Forward down/up pair only after movement has
+already occurred.
 
-The macOS event tap is the authority for Middle, Back, and Forward because these controls arrive as
-ordinary mouse buttons rather than capturable HID++ gesture controls on the M650. A Pan hold starts
-only after the configured button-down. While the hold is active, each physical motion contributes one
-two-axis pixel-scroll delta, and the replacement mouse event is pinned to the button-down location with
-both pointer deltas cleared. Release inside the deadzone dispatches the Pan click action; release after
-continuous movement does not. Window Navigation uses the same hold lifecycle but commits at most one
-directional action.
+Every effective per-button `Gesture` or `Pan` binding enters a HID capture request. The session
+intersects that request with the device's live control table and diverts only controls that advertise
+both `DIVERTABLE` and `RAW_XY`. `DivertedButtons` produces button-keyed pressed and released edges;
+signed raw-XY reports become button-keyed motion for the one active diverted control. Back `0x0053`
+therefore drives the Window Navigation accumulator while Forward `0x0056` independently drives the
+Pan accumulator. A raw-XY report does not include its source CID. If two requested gesture controls
+are held together, the session cancels the active lifecycle and ignores ambiguous motion until exactly
+one requested control remains held, when it begins a new keyed lifecycle.
+
+The OS-hook projection remains available for Middle, Back, and Forward as a compatibility path. It is
+the normal path for an ordinary `Single` binding and may interpret a typed gesture only when the
+device does not expose a usable raw-XY control and macOS supplies an observable down-motion-up chain.
+Middle Click commonly follows this path when configured as `Single(MissionControl)`. A control that
+lacks raw XY and reports only a delayed down/up pair cannot provide Pan or directional parity; OpenLogi
+must leave it native or report that the gesture is unavailable rather than infer a hold from unrelated
+pointer motion. The dedicated HID++ gesture button continues through the same keyed HID session when
+its live control advertises the required capabilities.
+
+A Pan hold starts at the keyed press. Each physical raw-XY report contributes one two-axis pixel-scroll
+delta. HID diversion is expected to prevent ordinary cursor travel; the macOS copied-event freeze path
+remains a guard for OS-hook gesture input and pins replacement motion to the press location with both
+pointer deltas cleared. Release inside the deadzone dispatches the Pan click action once; release after
+continuous movement does not. Window Navigation uses the same keyed lifecycle but commits at most one
+directional action. Physical verification records both HID++ `DivertedButtons`/raw-XY messages and any
+corresponding CGEvent stream; synthetic CGEvent success alone is insufficient evidence.
 
 ## Environment and external dependencies
 
@@ -91,11 +112,13 @@ would allow the GUI, config, and runtime projections to disagree and would make 
 Pan plus Back Window Navigation impossible. Whole-binding replacement for per-app overrides prevents a
 directional map from being partially inherited from an unrelated global preset.
 
-The OS hook consumes all effective gesture bindings in one generation. A single active hold remains
-intentional because macOS supplies one pointer-motion stream; if two configured buttons overlap, the
-newest press cancels the prior hold. This produces deterministic behavior without applying the same
-motion to two presets. HID++ and OS-hook inputs share cancellation arbitration so a stale release from
-one path cannot fire the other's click action.
+The HID capture request and OS-hook fallback both derive from all effective gesture bindings in one
+generation. A single active hold remains intentional: HID raw XY lacks a source CID, while the OS hook
+supplies one pointer-motion stream. A new unambiguous press cancels the prior hold; simultaneous HID
+holds cancel and suppress ambiguous motion. HID++ and OS-hook inputs share cancellation arbitration so
+a stale release from one path cannot fire the other's click action. A per-app promotion or demotion
+changes the complete request, invalidates the prior input epoch, restores the old session's controls,
+and opens a session for the new button set.
 
 Pan uses copied-event replacement at the active tap rather than reposting the original motion. A copy
 lets OpenLogi freeze the pointer without recursively processing its own replacement. Synthetic output
@@ -106,18 +129,26 @@ mandatory after every relevant OS change.
 
 ## Failure, degradation, and rollback
 
-If Accessibility permission is absent or the event tap is disabled, OpenLogi must fail open: native
-mouse buttons and pointer movement continue rather than being swallowed. The GUI reports authorization
-state and must not describe a preset as runtime-verified. Callback lock contention, a full action queue,
-capture interruption, device removal, app-profile change, or Agent restart cancels the active hold; a
-cancelled hold never emits Smart Zoom or a directional click.
+If Accessibility permission is absent or the event tap is disabled, OpenLogi must fail open for
+OS-hook controls: native mouse buttons and pointer movement continue rather than being swallowed. HID
+capture is independent of Accessibility, but it must arm only controls selected by the current binding
+and confirmed by the live `0x1b04` table. An unsupported or unrequested control remains under firmware
+control. The GUI reports authorization state and must not describe a preset as runtime-verified.
 
-If raw physical capture shows no Forward down/up, the implementation must not compensate with guessed
-button numbers or synthetic events. Diagnose HID++ diversion and other Logitech software ownership. If
-the captured button differs from the model mapping, update the mapping from that evidence. If motion
-deltas are zero while locations change, derive travel from successive physical locations and cover that
-shape with a regression test. Unsupported non-macOS Pan remains inert and preserves its config for later
-use on macOS.
+Capture setup is one transaction across gesture CIDs, DPI controls, and the thumb wheel. Capability
+discovery completes before any mutation. If any enable fails, OpenLogi first disables the failed control
+itself because the device may have applied a request whose response was lost, then disables every
+previously enabled control in reverse order. Normal shutdown, device removal, pairing takeover,
+configuration reload, per-app switch, and Agent restart cancel the active hold and restore the same
+control list in reverse order. A cancelled hold never emits Smart Zoom or a directional click.
+
+If HID capture shows no Forward press/raw-XY/release chain, the implementation must not compensate with
+guessed CGEvent button numbers or synthetic input. Inspect the live `0x1b04` table, the exact
+`setCidReporting` responses, receiver ownership, and competing Logitech software. If a requested
+control lacks `DIVERTABLE` or `RAW_XY`, retain native behavior unless the OS hook supplies a complete
+physical lifecycle. If the HID report becomes ambiguous because two controls are held, cancel it rather
+than attributing motion by timing. Unsupported non-macOS Pan remains inert and preserves its config for
+later use on macOS.
 
 Installation is recoverable: retain the previous `/Applications/OpenLogi.app` bundle before replacing
 it, and keep the previous config or a copy before any schema migration. Rollback quits the new GUI and
@@ -136,14 +167,18 @@ owner state.
 ## Verification
 
 - Core migration and round-trip tests cover simultaneous Forward Pan + Back Window Navigation.
-- Agent-core tests project and dispatch both buttons concurrently, including per-app overlays and
-  overlapping-hold cancellation.
+- HID tests discover and arm requested Back/Forward CIDs, preserve signed XY, reject unsupported
+  controls, cancel ambiguous two-button holds, and roll back partial setup across gesture, DPI, and
+  thumb-wheel controls.
+- Agent-core tests project and dispatch both buttons concurrently, including per-app overlays,
+  session-epoch invalidation, keyed stale-release rejection, and overlapping-hold cancellation.
 - GUI pure-state tests prove one card changes without demoting another and labels classify both.
-- macOS hook tests cover the physical motion event shapes and feedback prevention.
+- macOS hook tests cover the fallback physical motion event shapes and feedback prevention.
 - Installed ARM64 app verification runs with the PPID-1 bundled agent and stable configuration.
 - Final hardware acceptance uses the real M650: Forward hold+move pans without pointer travel; Forward
   click Smart Zooms; Back performs all five Window Navigation directions; Middle opens Mission Control;
-  ordinary wheel behavior is unchanged.
+  ordinary wheel behavior is unchanged. The evidence includes the HID++ lifecycle and proves every
+  diverted CID is restored after reload and shutdown.
 
 ## Local acceptance procedure and expected results
 
@@ -165,6 +200,7 @@ Physical Back must implement the canonical five outputs: click and upward gestur
 downward gesture opens App Expose, left switches to the previous desktop, and right switches to the next
 desktop. Each hold commits no more than one direction and does not also emit the native browser Back
 action. Physical Middle Click must open Mission Control once and must not pass through as an ordinary
-middle click. The raw evidence bundle records event type, button number, deltas, location, user-data,
-Agent monitor output, installed binary hashes, config, and restart result. Every row must pass repeatedly
-before the feature is considered complete.
+middle click. The raw evidence bundle records HID++ CID, diverted-button set, signed XY, reporting
+enable/restore responses, CGEvent type, button number, deltas, location, user-data, Agent monitor output,
+installed binary hashes, config, profile switch, interruption/overlap recovery, and restart result.
+Every row must pass repeatedly before the feature is considered complete.
