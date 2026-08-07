@@ -209,7 +209,7 @@ mod tests {
             "2b042",
             "com.apple.Safari",
             ButtonId::Back,
-            Some(Action::NextTab),
+            Some(Binding::Single(Action::NextTab)),
         );
         assert!(
             oshook_gestures_for(&cfg, Some("2b042"), Some("com.apple.Safari")).is_empty(),

@@ -89,6 +89,10 @@ pub(super) fn execute(action: &Action) {
         Action::NextDesktop => next_desktop(),
         Action::ShowDesktop => show_desktop(),
         Action::LaunchpadShow => launchpad(),
+        // The dedicated Smart Magnify injector is added by the macOS Pan
+        // integration task. Keep this arm explicit so the interim model is
+        // compile-safe without pretending a different action is equivalent.
+        Action::SmartZoom => tracing::warn!("Smart Zoom injection is not implemented; ignored"),
         // ── System ────────────────────────────────────────────────────────
         // Lock screen = Cmd+Ctrl+Q (kVK_ANSI_Q = 0x0C)
         Action::LockScreen => post_key(0x0C, cmd | ctrl),

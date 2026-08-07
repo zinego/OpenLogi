@@ -97,8 +97,8 @@ impl PanAccumulator {
     }
 
     /// Cancel an interrupted hold without ever committing its click fallback.
-    /// Returns [`PanOutput::End`] when state was active and [`PanOutput::Idle`]
-    /// when there was no hold to cancel.
+    /// Returns [`PanOutput::End`] whenever a pending or active hold was
+    /// cancelled, and [`PanOutput::Idle`] when there was no hold to cancel.
     pub fn cancel(&mut self) -> PanOutput {
         if !self.holding {
             return PanOutput::Idle;
