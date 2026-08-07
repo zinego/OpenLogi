@@ -108,7 +108,7 @@ enum BindingPopover {
 
 impl Render for MouseModelView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (device_key, asset, active, bindings, gesture_owner, glow) = cx
+        let (device_key, asset, active, bindings, gesture_owner, gesture_binding, glow) = cx
             .try_global::<AppState>()
             .map(|s| {
                 (
@@ -117,6 +117,7 @@ impl Render for MouseModelView {
                     s.active_button,
                     s.button_bindings.clone(),
                     s.current_gesture_owner(),
+                    s.current_gesture_binding(),
                     s.current_record().and_then(|r| keyboard_glow(s, r)),
                 )
             })
@@ -184,10 +185,21 @@ impl Render for MouseModelView {
             .child(leader_canvas)
             .children(labels_outer.iter().enumerate().map(|(idx, label)| {
                 let binding = if Some(label.id) == gesture_owner {
-                    BindingLabel {
-                        text: tr!("5 directions"),
-                        is_default: false,
-                        icon: Some(GESTURE_BUTTON_ICON),
+                    if gesture_binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.is_pan())
+                    {
+                        BindingLabel {
+                            text: tr!("Pan"),
+                            is_default: false,
+                            icon: Some("action-icons/scroll-text.svg"),
+                        }
+                    } else {
+                        BindingLabel {
+                            text: tr!("5 directions"),
+                            is_default: false,
+                            icon: Some(GESTURE_BUTTON_ICON),
+                        }
                     }
                 } else {
                     // `bindings` is seeded for every `ButtonId::ALL` (agent-core

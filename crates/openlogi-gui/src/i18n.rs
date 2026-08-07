@@ -209,6 +209,12 @@ mod tests {
         assert_eq!(rust_i18n::t!("Unbound"), "未绑定"); // mouse model card state
         assert_eq!(rust_i18n::t!("Default"), "默认"); // default-binding card state
         assert_eq!(rust_i18n::t!("5 directions"), "5 个方向"); // gesture card summary
+        assert_eq!(rust_i18n::t!("Gesture preset"), "手势预设");
+        assert_eq!(rust_i18n::t!("Window Navigation"), "窗口导航");
+        assert_eq!(rust_i18n::t!("Pan"), "平移");
+        assert_eq!(rust_i18n::t!("Continuous"), "连续");
+        assert_eq!(rust_i18n::t!("Click action"), "单击操作");
+        assert_eq!(rust_i18n::t!("Smart Zoom"), "智能缩放");
         assert_eq!(
             rust_i18n::t!("DPI Preset %{index}", index => "2"),
             "灵敏度预设 2"

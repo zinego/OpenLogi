@@ -5,13 +5,10 @@
 //!   list inside a gpui-component [`Popover`](gpui_component::popover::Popover).
 //!   Generic over the entity that should be notified after a binding changes so
 //!   the trigger re-renders with the new label.
-//! - [`gesture_overview`] — the gesture button's custom multi-level menu: a
-//!   plus-shaped navigator card (level 1) listing all five [`GestureDirection`]s
-//!   with their bound actions, and — once a direction is activated — a separate
-//!   action-list card (level 2) that flies out beside it. The two are distinct
-//!   floating cards (own surface + height), so this reads like a cascading menu
-//!   while staying fully custom-styled. The active direction is scratch state on
-//!   the [`MouseModelView`].
+//! - [`gesture_overview`] — the gesture button's preset selector plus either a
+//!   five-direction custom navigator or continuous Pan summary. Editable actions
+//!   open a separate action-list card beside the summary. The active direction
+//!   is scratch state on the [`MouseModelView`].
 //!
 //! The [`action_picker`] [`Popover`] uses the framework's styled surface; the
 //! gesture menu uses `appearance(false)` and draws its own card surfaces, since
@@ -29,8 +26,9 @@ use gpui::{
 use gpui_component::{Icon, IconName, h_flex, popover::PopoverState, v_flex};
 
 use crate::data::mouse_buttons::{
-    Action, ButtonId, Category, GestureDirection, default_gesture_binding,
+    Action, Binding, ButtonId, Category, GestureDirection, default_gesture_binding,
 };
+use crate::gesture_presets::{GesturePreset, available_gesture_presets, classify_gesture_preset};
 use crate::mouse_model::view::MouseModelView;
 use crate::state::AppState;
 use crate::theme::{self, ACCENT_BLUE, Palette, SelectableStyle, Typography as _};
@@ -85,25 +83,203 @@ pub fn action_picker<T: 'static>(
 /// by side in the middle row, so the plus is roughly `3×` this plus gaps.
 const GESTURE_CELL_W: f32 = 104.;
 
-/// Build the gesture button's custom two-level menu: the plus navigator card
-/// (level 1) plus, once a direction is activated, its action-list card (level 2)
-/// flown out beside it. The two are separate floating cards — own surface and
-/// height — so it reads like a cascading menu without sharing one box. The
-/// active direction is scratch UI state on the [`MouseModelView`] (`None` until
-/// a cell is clicked → only the plus shows), reset on popover close. Mutating it
-/// re-renders the view, which re-renders this open popover's content.
+/// Build the gesture button's preset selector and binding editor. Directional
+/// bindings render the existing plus navigator; Pan renders four continuous
+/// directions and an editable click fallback. Activating an editable cell opens
+/// its action-list card beside the summary. Scratch selection lives on the
+/// [`MouseModelView`] and resets when the popover closes or its preset changes.
 pub fn gesture_overview(
     view: &Entity<MouseModelView>,
     cx: &mut Context<PopoverState>,
 ) -> AnyElement {
     let pal = theme::palette(cx);
     let active = view.read(cx).gesture_selected_dir();
-    h_flex()
+    let binding = cx
+        .try_global::<AppState>()
+        .and_then(AppState::current_gesture_binding)
+        .unwrap_or_else(|| {
+            Binding::Gesture(
+                GestureDirection::ALL
+                    .into_iter()
+                    .map(|direction| (direction, default_gesture_binding(direction)))
+                    .collect(),
+            )
+        });
+    let preset = classify_gesture_preset(&binding);
+    let is_pan = binding.is_pan();
+    v_flex()
         .items_start()
         .gap_2()
-        .child(plus_card(view, active, pal, cx))
-        // The flyout card only appears once a direction is activated.
-        .when_some(active, |row, dir| row.child(flyout_card(dir, view, pal, cx)))
+        .child(preset_card(preset, view, pal))
+        .child(
+            h_flex()
+                .items_start()
+                .gap_2()
+                .child(if is_pan {
+                    pan_card(&binding, view, active, pal)
+                } else {
+                    plus_card(view, active, pal, cx)
+                })
+                // The flyout card only appears once a direction is activated.
+                .when_some(active, |row, dir| {
+                    row.child(if is_pan {
+                        pan_flyout_card(&binding, dir, view, pal, cx)
+                    } else {
+                        flyout_card(dir, view, pal, cx)
+                    })
+                }),
+        )
+        .into_any_element()
+}
+
+fn preset_card(current: GesturePreset, view: &Entity<MouseModelView>, pal: Palette) -> AnyElement {
+    menu_card(pal)
+        .gap_1p5()
+        .child(title(tr!("Gesture preset"), pal))
+        .child(
+            h_flex().gap_1p5().children(
+                available_gesture_presets(cfg!(target_os = "macos"))
+                    .iter()
+                    .copied()
+                    .map(|preset| preset_chip(preset, current, view, pal)),
+            ),
+        )
+        .into_any_element()
+}
+
+fn preset_chip(
+    preset: GesturePreset,
+    current: GesturePreset,
+    view: &Entity<MouseModelView>,
+    pal: Palette,
+) -> AnyElement {
+    let selected = preset == current;
+    let (id, label) = match preset {
+        GesturePreset::WindowNavigation => (0usize, tr!("Window Navigation")),
+        GesturePreset::Pan => (1, tr!("Pan")),
+        GesturePreset::Custom => (2, tr!("Custom")),
+    };
+    let view = view.clone();
+    div()
+        .id(("gesture-preset", id))
+        .role(Role::RadioButton)
+        .aria_label(label.clone())
+        .aria_selected(selected)
+        .px_2()
+        .py_1()
+        .rounded(pal.control_radius)
+        .selected_border(selected, pal)
+        .selected_fill(selected)
+        .text_caption()
+        .text_color(if selected {
+            pal.text_primary
+        } else {
+            pal.text_muted
+        })
+        .when(!selected, |chip| {
+            chip.hover(move |style| style.bg(pal.surface_hover))
+        })
+        .cursor_pointer()
+        .child(label)
+        .on_click(move |_event, _window, cx| {
+            cx.update_global::<AppState, _>(|state, _| state.commit_gesture_preset(preset));
+            view.update(cx, |model, vcx| {
+                model.set_gesture_selected_dir(None);
+                vcx.notify();
+            });
+        })
+        .into_any_element()
+}
+
+fn pan_card(
+    binding: &Binding,
+    view: &Entity<MouseModelView>,
+    active: Option<GestureDirection>,
+    pal: Palette,
+) -> AnyElement {
+    let click = binding.click_action();
+    let continuous = |direction| pan_direction_cell(direction, pal);
+    menu_card(pal)
+        .gap_1p5()
+        .child(
+            h_flex()
+                .w_full()
+                .justify_center()
+                .child(continuous(GestureDirection::Up)),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .justify_center()
+                .gap_1p5()
+                .child(continuous(GestureDirection::Left))
+                .child(direction_cell(
+                    GestureDirection::Click,
+                    &click,
+                    active == Some(GestureDirection::Click),
+                    view,
+                    pal,
+                ))
+                .child(continuous(GestureDirection::Right)),
+        )
+        .child(
+            h_flex()
+                .w_full()
+                .justify_center()
+                .child(continuous(GestureDirection::Down)),
+        )
+        .into_any_element()
+}
+
+fn pan_direction_cell(direction: GestureDirection, pal: Palette) -> AnyElement {
+    let header = format!("{}  {}", direction.glyph(), tr!(direction.label()));
+    v_flex()
+        .w(px(GESTURE_CELL_W))
+        .gap(px(2.))
+        .px_2()
+        .py_1p5()
+        .rounded(pal.control_radius)
+        .border_1()
+        .border_color(pal.border)
+        .child(
+            div()
+                .text_caption()
+                .text_color(pal.text_muted)
+                .child(header),
+        )
+        .child(
+            div()
+                .text_body()
+                .text_color(pal.text_primary)
+                .child(tr!("Continuous")),
+        )
+        .into_any_element()
+}
+
+fn pan_flyout_card(
+    binding: &Binding,
+    direction: GestureDirection,
+    view: &Entity<MouseModelView>,
+    pal: Palette,
+    _cx: &mut Context<PopoverState>,
+) -> AnyElement {
+    if direction != GestureDirection::Click {
+        return div().into_any_element();
+    }
+    let current = binding.click_action();
+    let view_pick = view.clone();
+    let on_pick: PickFn = Rc::new(move |action, _window, cx| {
+        cx.update_global::<AppState, _>(|state, _| state.commit_pan_click(action));
+        view_pick.update(cx, |_, vcx| vcx.notify());
+    });
+    menu_card(pal)
+        .min_w(px(POPOVER_W))
+        .child(title(tr!("Click action"), pal))
+        .child(divider(pal))
+        .child(scroll_list(
+            "pan-click-scroll",
+            action_rows("pan-click-action", Some(&current), &on_pick, pal),
+        ))
         .into_any_element()
 }
 
@@ -329,6 +505,7 @@ pub(crate) fn action_icon_path(action: &Action) -> &'static str {
         Action::NextDesktop => "action-icons/square-arrow-right.svg",
         Action::ShowDesktop => "action-icons/monitor.svg",
         Action::LaunchpadShow => "action-icons/grid-3x3.svg",
+        Action::SmartZoom => "action-icons/search.svg",
         Action::LockScreen => "action-icons/lock.svg",
         Action::Screenshot | Action::CaptureRegion => "action-icons/camera.svg",
         Action::PlayPause => "action-icons/play.svg",

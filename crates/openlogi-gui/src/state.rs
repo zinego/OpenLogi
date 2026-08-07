@@ -48,11 +48,15 @@ use load::LazyDeviceData;
 
 use crate::asset::AssetResolver;
 use crate::data::mouse_buttons::{Action, Binding, ButtonId, GestureDirection};
+use crate::gesture_presets::{
+    GesturePreset, apply_binding_to_scope, binding_for_gesture_preset,
+    gesture_binding_with_direction, pan_binding_with_click,
+};
 use crate::state::devices::{
     adopt_transient_record, build_device_list, direct_key_prefix, pick_initial_device,
     sort_device_list,
 };
-use openlogi_agent_core::bindings::{bindings_for, gesture_bindings_for};
+use openlogi_agent_core::bindings::bindings_for;
 use openlogi_agent_core::device_order::PhysicalDeviceKey;
 
 /// Default DPI value applied to a fresh AppState. Matches a common Logitech
@@ -1351,24 +1355,34 @@ impl AppState {
         )
     }
 
-    fn gesture_bindings_for_current(&self) -> BTreeMap<GestureDirection, Action> {
+    /// The effective complete binding for the current gesture owner, including
+    /// the foreground application's whole-binding override.
+    #[must_use]
+    pub(crate) fn current_gesture_binding(&self) -> Option<Binding> {
         let Some(key) = self
             .current_record()
             .and_then(DeviceRecord::persistent_config_key)
         else {
+            return None;
+        };
+        let owner = self.config.gesture_owner(key)?;
+        self.config
+            .effective_bindings(key, self.current_app_bundle.as_deref())
+            .remove(&owner)
+            .or_else(|| {
+                (owner == ButtonId::GestureButton)
+                    .then(|| openlogi_core::binding::default_binding_for(owner))
+            })
+    }
+
+    fn gesture_bindings_for_current(&self) -> BTreeMap<GestureDirection, Action> {
+        let Some(mut binding) = self.current_gesture_binding() else {
             return BTreeMap::new();
         };
-        match self.config.gesture_owner(key) {
-            // The HID++ gesture button seeds every direction from the defaults.
-            Some(ButtonId::GestureButton) => gesture_bindings_for(&self.config, Some(key)),
-            // A promoted OS-hook button is shown from its raw stored map (which
-            // `set_gesture_owner` seeds with full defaults), so the menu matches
-            // exactly what `oshook_gestures_for` dispatches — no seeding here.
-            Some(owner) => match self.config.bindings_for(key).get(&owner) {
-                Some(Binding::Gesture(map)) => map.clone(),
-                _ => BTreeMap::new(),
-            },
-            None => BTreeMap::new(),
+        binding.fill_gesture_defaults();
+        match binding {
+            Binding::Gesture(map) => map,
+            Binding::Single(_) | Binding::Pan(_) => BTreeMap::new(),
         }
     }
 
@@ -1406,36 +1420,59 @@ impl AppState {
         self.persist_and_reload("gesture-button change");
     }
 
-    /// Update a single gesture-button sub-binding in memory, on disk, and in the
-    /// shared gesture map the watcher thread reads.
-    pub fn commit_gesture_binding(&mut self, direction: GestureDirection, action: Action) {
+    /// Atomically replace the current gesture owner's complete binding in the
+    /// global or foreground-application scope, then persist and reload once.
+    fn commit_complete_gesture_binding(&mut self, binding: Binding) {
         let Some(key) = self
             .current_record()
             .and_then(DeviceRecord::persistent_config_key)
             .map(str::to_string)
         else {
-            debug!(
-                ?direction,
-                "no persistent device key — gesture binding edit ignored"
-            );
             return;
         };
-        // Edit whichever button owns gestures — not always the HID++ gesture button. When
-        // gestures are off, a stray edit must NOT silently re-enable them on the
-        // default owner (the gesture editor shouldn't be reachable in that state):
-        // no-op instead.
         let Some(owner) = self.config.gesture_owner(&key) else {
-            debug!(
-                ?direction,
-                "gestures are off — ignoring gesture binding edit"
-            );
             return;
         };
-        self.gesture_bindings.insert(direction, action.clone());
-        self.config
-            .set_gesture_direction(&key, owner, direction, action);
-        // The agent owns the gesture watcher; have it rebuild from config.
+        apply_binding_to_scope(
+            &mut self.config,
+            &key,
+            self.current_app_bundle.as_deref(),
+            owner,
+            binding,
+        );
+        self.button_bindings = self.bindings_for_current();
+        self.gesture_bindings = self.gesture_bindings_for_current();
         self.persist_and_reload("gesture binding");
+    }
+
+    /// Apply a whole gesture preset without exposing per-direction intermediate
+    /// states to the agent or writing the config more than once.
+    pub(crate) fn commit_gesture_preset(&mut self, preset: GesturePreset) {
+        self.commit_complete_gesture_binding(binding_for_gesture_preset(preset));
+    }
+
+    /// Update the click fallback of the current Pan binding as one complete
+    /// binding replacement. A stale callback after leaving Pan is a no-op.
+    pub(crate) fn commit_pan_click(&mut self, action: Action) {
+        let Some(binding) = self.current_gesture_binding() else {
+            return;
+        };
+        if !binding.is_pan() {
+            return;
+        }
+        self.commit_complete_gesture_binding(pan_binding_with_click(&binding, action));
+    }
+
+    /// Update a single gesture-button sub-binding in memory, on disk, and in the
+    /// shared gesture map the watcher thread reads.
+    pub fn commit_gesture_binding(&mut self, direction: GestureDirection, action: Action) {
+        let Some(current) = self.current_gesture_binding() else {
+            debug!(?direction, "no active gesture binding — edit ignored");
+            return;
+        };
+        self.commit_complete_gesture_binding(gesture_binding_with_direction(
+            &current, direction, action,
+        ));
     }
 }
 

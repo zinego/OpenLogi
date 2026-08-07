@@ -36,6 +36,7 @@ mod asset;
 mod components;
 mod data;
 mod diagnostics;
+mod gesture_presets;
 mod i18n;
 mod ipc_client;
 mod mouse_model;
