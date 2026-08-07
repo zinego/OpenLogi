@@ -89,10 +89,7 @@ pub(super) fn execute(action: &Action) {
         Action::NextDesktop => next_desktop(),
         Action::ShowDesktop => show_desktop(),
         Action::LaunchpadShow => launchpad(),
-        // The dedicated Smart Magnify injector is added by the macOS Pan
-        // integration task. Keep this arm explicit so the interim model is
-        // compile-safe without pretending a different action is equivalent.
-        Action::SmartZoom => tracing::warn!("Smart Zoom injection is not implemented; ignored"),
+        Action::SmartZoom => post_smart_magnify(),
         // ── System ────────────────────────────────────────────────────────
         // Lock screen = Cmd+Ctrl+Q (kVK_ANSI_Q = 0x0C)
         Action::LockScreen => post_key(0x0C, cmd | ctrl),
@@ -288,6 +285,40 @@ fn post_media_key(nx_key: i32) {
     });
 }
 
+/// Post AppKit's native Smart Magnify gesture at the current pointer location.
+fn post_smart_magnify() {
+    use objc2::rc::autoreleasepool;
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    use objc2_core_graphics::{CGEvent, CGEventField, CGEventTapLocation};
+
+    autoreleasepool(|_| {
+        let Some(ns_event) = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType(super::smart_magnify_event_type()),
+            NSEvent::mouseLocation(),
+            NSEventModifierFlags::empty(),
+            0.0,
+            0,
+            None,
+            0,
+            0,
+            0,
+        ) else {
+            tracing::warn!("NSEvent::otherEventWithType failed for Smart Magnify");
+            return;
+        };
+        let Some(cg_event) = ns_event.CGEvent() else {
+            tracing::warn!("NSEvent::CGEvent failed for Smart Magnify");
+            return;
+        };
+        CGEvent::set_integer_value_field(
+            Some(&cg_event),
+            CGEventField::EventSourceUserData,
+            super::SYNTHETIC_EVENT_USER_DATA,
+        );
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&cg_event));
+    });
+}
+
 /// Post a synthetic scroll event for `action` (one of the `Scroll*` variants).
 fn post_scroll(action: &Action) {
     let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
@@ -318,6 +349,26 @@ pub(super) fn post_horizontal_scroll(delta: i32) {
     };
     let Ok(ev) = CGEvent::new_scroll_event(src, ScrollEventUnit::LINE, 2, 0, delta, 0) else {
         tracing::warn!("CGEvent::new_scroll_event failed for thumbwheel");
+        return;
+    };
+    tag_synthetic(&ev);
+    ev.post(CGEventTapLocation::HID);
+}
+
+/// Post one pixel-unit scroll event carrying both axes of physical Pan motion.
+pub(super) fn post_pan_scroll(delta_x: i32, delta_y: i32) {
+    let Some(spec) = super::pan_scroll_event(delta_x, delta_y) else {
+        return;
+    };
+    let Ok(src) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+        tracing::warn!("CGEventSource::new failed for Pan scroll");
+        return;
+    };
+    let unit = match spec.unit {
+        super::PanScrollUnit::Pixel => ScrollEventUnit::PIXEL,
+    };
+    let Ok(ev) = CGEvent::new_scroll_event(src, unit, 2, spec.vertical, spec.horizontal, 0) else {
+        tracing::warn!("CGEvent::new_scroll_event failed for Pan");
         return;
     };
     tag_synthetic(&ev);

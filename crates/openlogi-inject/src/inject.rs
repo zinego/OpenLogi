@@ -101,6 +101,49 @@ pub fn post_horizontal_scroll(delta: i32) {
     }
 }
 
+/// Synthesise one pixel-unit scroll event containing both Pan motion axes.
+///
+/// `delta_x` and `delta_y` are physical mouse motion: positive values mean
+/// right and down, respectively. macOS scroll-event deltas describe wheel
+/// motion, so both axes are sign-converted to keep the page content moving in
+/// the same direction as the mouse. `(0, 0)` is a no-op.
+///
+/// On non-macOS platforms this fails closed and posts no event.
+pub fn post_pan_scroll(delta_x: i32, delta_y: i32) {
+    cfg_select! {
+        target_os = "macos" => {
+            macos::post_pan_scroll(delta_x, delta_y);
+        }
+        _ => {
+            let _ = (delta_x, delta_y);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PanScrollUnit {
+    Pixel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PanScrollEvent {
+    unit: PanScrollUnit,
+    vertical: i32,
+    horizontal: i32,
+}
+
+fn pan_scroll_event(delta_x: i32, delta_y: i32) -> Option<PanScrollEvent> {
+    (delta_x != 0 || delta_y != 0).then(|| PanScrollEvent {
+        unit: PanScrollUnit::Pixel,
+        vertical: delta_y.saturating_neg(),
+        horizontal: delta_x.saturating_neg(),
+    })
+}
+
+const fn smart_magnify_event_type() -> usize {
+    32
+}
+
 /// Return the `/dev/input/eventN` node for the action-injector uinput device,
 /// initialising it if needed.
 ///
@@ -236,6 +279,55 @@ fn mac_virtual_key_to_windows(key_code: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
+    use super::{PanScrollEvent, PanScrollUnit, pan_scroll_event, smart_magnify_event_type};
+
+    #[test]
+    fn pan_scroll_maps_both_mouse_axes_to_pixel_content_motion() {
+        assert_eq!(
+            pan_scroll_event(8, -5),
+            Some(PanScrollEvent {
+                unit: PanScrollUnit::Pixel,
+                vertical: 5,
+                horizontal: -8,
+            })
+        );
+    }
+
+    #[test]
+    fn pan_scroll_omits_only_an_entirely_stationary_event() {
+        assert_eq!(pan_scroll_event(0, 0), None);
+        assert_eq!(
+            pan_scroll_event(4, 0),
+            Some(PanScrollEvent {
+                unit: PanScrollUnit::Pixel,
+                vertical: 0,
+                horizontal: -4,
+            })
+        );
+        assert_eq!(
+            pan_scroll_event(0, -7),
+            Some(PanScrollEvent {
+                unit: PanScrollUnit::Pixel,
+                vertical: 7,
+                horizontal: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn pan_scroll_direction_conversion_cannot_overflow() {
+        let Some(event) = pan_scroll_event(i32::MIN, i32::MIN) else {
+            panic!("non-zero motion must produce an event");
+        };
+        assert_eq!(event.horizontal, i32::MAX);
+        assert_eq!(event.vertical, i32::MAX);
+    }
+
+    #[test]
+    fn smart_zoom_uses_the_native_smart_magnify_event_type() {
+        assert_eq!(smart_magnify_event_type(), 32);
+    }
+
     #[test]
     fn custom_shortcut_keycodes_map_across_categories() {
         use super::mac_virtual_key_to_windows;
