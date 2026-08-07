@@ -1312,6 +1312,71 @@ click = "Paste"
     }
 
     #[test]
+    fn gesture_owner_legacy_non_dedicated_state_materializes_inactive_gesture_button() {
+        for schema_version in [2, 3] {
+            for owner_line in [
+                "gesture_owner = \"Off\"",
+                "gesture_owner = \"Forward\"",
+                "gesture_owner = \"bogus\"",
+                "",
+            ] {
+                let legacy = format!(
+                    r#"
+schema_version = {schema_version}
+
+[devices.mouse]
+{owner_line}
+
+[devices.mouse.bindings]
+Back = "BrowserBack"
+"#
+                );
+                let dir = tempfile::tempdir().expect("tempdir");
+                let path = dir.path().join("config.toml");
+                fs::write(&path, legacy).expect("write legacy config");
+
+                let bindings = Config::load_from_path(&path)
+                    .expect("load legacy config")
+                    .bindings_for("mouse");
+                assert_eq!(
+                    bindings.get(&ButtonId::GestureButton),
+                    Some(&Binding::Single(default_binding(ButtonId::GestureButton))),
+                    "schema {schema_version}, owner line {owner_line:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn gesture_owner_legacy_dedicated_owner_preserves_absent_implicit_default() {
+        for schema_version in [2, 3] {
+            let legacy = format!(
+                r#"
+schema_version = {schema_version}
+
+[devices.mouse]
+gesture_owner = "GestureButton"
+
+[devices.mouse.bindings]
+Back = "BrowserBack"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, legacy).expect("write legacy config");
+
+            let bindings = Config::load_from_path(&path)
+                .expect("load legacy config")
+                .bindings_for("mouse");
+            assert_eq!(
+                bindings.get(&ButtonId::GestureButton),
+                None,
+                "schema {schema_version}"
+            );
+        }
+    }
+
+    #[test]
     fn gesture_owner_schema_v3_off_demotes_every_typed_binding() {
         let legacy = r#"
 schema_version = 3

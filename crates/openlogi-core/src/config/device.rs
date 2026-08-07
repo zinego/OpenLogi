@@ -228,6 +228,15 @@ impl DeviceConfig {
         for overlay in self.per_app_bindings.values_mut() {
             normalize_legacy_bindings(overlay, owner);
         }
+        let dedicated_owner = matches!(
+            owner,
+            Some(LegacyGestureOwner::Button(ButtonId::GestureButton))
+        );
+        if !dedicated_owner {
+            self.bindings
+                .entry(ButtonId::GestureButton)
+                .or_insert_with(|| Binding::Single(default_binding(ButtonId::GestureButton)));
+        }
     }
 }
 

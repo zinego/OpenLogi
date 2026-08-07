@@ -16,7 +16,9 @@ OpenLogi reloads it on startup. Older `schema_version = 1` files (separate
 `bindings` map on first load. Schemas 2 and 3's device-wide `gesture_owner` is
 also consumed on load: its active typed binding is retained and dormant
 gesture/Pan maps in both global and per-application bindings are reduced to
-their click action (or the button's native default).
+their click action (or the button's native default). A disabled or
+non-dedicated legacy owner also records the dedicated gesture button as a
+single action so the schema-4 default cannot reactivate it.
 
 Per-device settings are keyed by the HID++ identifier (e.g. `2b042` for an
 MX Master 4):
