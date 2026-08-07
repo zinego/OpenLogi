@@ -96,6 +96,17 @@ pub(crate) fn binding_for_gesture_preset(preset: GesturePreset) -> Binding {
     }
 }
 
+/// Return the one complete binding needed for a newly selected preset.
+/// Reselecting the active preset is a no-op so customized values within that
+/// mode are not replaced by its canonical factory defaults.
+#[must_use]
+pub(crate) fn binding_for_gesture_selection(
+    current: &Binding,
+    selected: GesturePreset,
+) -> Option<Binding> {
+    (classify_gesture_preset(current) != selected).then(|| binding_for_gesture_preset(selected))
+}
+
 /// Return a complete directional binding with one edited direction.
 #[must_use]
 pub(crate) fn gesture_binding_with_direction(
@@ -208,6 +219,49 @@ mod tests {
             Binding::Pan(PanBinding {
                 click: Action::MissionControl,
             })
+        );
+    }
+
+    #[test]
+    fn reselecting_pan_preserves_custom_click_without_a_mutation() {
+        let binding = Binding::Pan(PanBinding {
+            click: Action::MissionControl,
+        });
+
+        assert_eq!(
+            binding_for_gesture_selection(&binding, GesturePreset::Pan),
+            None
+        );
+        assert_eq!(binding.click_action(), Action::MissionControl);
+    }
+
+    #[test]
+    fn reselecting_custom_preserves_the_complete_binding_without_a_mutation() {
+        let binding = gesture_binding_with_direction(
+            &window_navigation_binding(),
+            GestureDirection::Left,
+            Action::Copy,
+        );
+
+        assert_eq!(
+            binding_for_gesture_selection(&binding, GesturePreset::Custom),
+            None
+        );
+        assert_eq!(
+            binding.direction_action(GestureDirection::Left),
+            Some(&Action::Copy)
+        );
+    }
+
+    #[test]
+    fn selecting_a_different_preset_returns_one_complete_binding_mutation() {
+        let current = Binding::Pan(PanBinding {
+            click: Action::MissionControl,
+        });
+
+        assert_eq!(
+            binding_for_gesture_selection(&current, GesturePreset::WindowNavigation),
+            Some(window_navigation_binding())
         );
     }
 }

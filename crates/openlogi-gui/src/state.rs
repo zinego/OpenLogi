@@ -49,7 +49,7 @@ use load::LazyDeviceData;
 use crate::asset::AssetResolver;
 use crate::data::mouse_buttons::{Action, Binding, ButtonId, GestureDirection};
 use crate::gesture_presets::{
-    GesturePreset, apply_binding_to_scope, binding_for_gesture_preset,
+    GesturePreset, apply_binding_to_scope, binding_for_gesture_selection,
     gesture_binding_with_direction, pan_binding_with_click,
 };
 use crate::state::devices::{
@@ -1448,7 +1448,13 @@ impl AppState {
     /// Apply a whole gesture preset without exposing per-direction intermediate
     /// states to the agent or writing the config more than once.
     pub(crate) fn commit_gesture_preset(&mut self, preset: GesturePreset) {
-        self.commit_complete_gesture_binding(binding_for_gesture_preset(preset));
+        let Some(current) = self.current_gesture_binding() else {
+            return;
+        };
+        let Some(binding) = binding_for_gesture_selection(&current, preset) else {
+            return;
+        };
+        self.commit_complete_gesture_binding(binding);
     }
 
     /// Update the click fallback of the current Pan binding as one complete

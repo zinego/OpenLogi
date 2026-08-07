@@ -159,7 +159,6 @@ fn preset_chip(
         GesturePreset::Pan => (1, tr!("Pan")),
         GesturePreset::Custom => (2, tr!("Custom")),
     };
-    let view = view.clone();
     div()
         .id(("gesture-preset", id))
         .role(Role::RadioButton)
@@ -176,17 +175,22 @@ fn preset_chip(
         } else {
             pal.text_muted
         })
-        .when(!selected, |chip| {
-            chip.hover(move |style| style.bg(pal.surface_hover))
-        })
-        .cursor_pointer()
         .child(label)
-        .on_click(move |_event, _window, cx| {
-            cx.update_global::<AppState, _>(|state, _| state.commit_gesture_preset(preset));
-            view.update(cx, |model, vcx| {
-                model.set_gesture_selected_dir(None);
-                vcx.notify();
-            });
+        .when(!selected, {
+            let view = view.clone();
+            move |chip| {
+                chip.hover(move |style| style.bg(pal.surface_hover))
+                    .cursor_pointer()
+                    .on_click(move |_event, _window, cx| {
+                        cx.update_global::<AppState, _>(|state, _| {
+                            state.commit_gesture_preset(preset);
+                        });
+                        view.update(cx, |model, vcx| {
+                            model.set_gesture_selected_dir(None);
+                            vcx.notify();
+                        });
+                    })
+            }
         })
         .into_any_element()
 }
