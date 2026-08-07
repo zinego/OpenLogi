@@ -261,6 +261,12 @@ impl HoldState {
         self.gesture = None;
         HoldOutput::Suppress
     }
+
+    fn cancel_on_release(&mut self, button: ButtonId) -> HoldOutput {
+        let output = self.cancel();
+        let _ = self.consume_cancelled_release(button);
+        output
+    }
 }
 
 fn release_bit(button: ButtonId) -> u8 {
@@ -459,7 +465,11 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
     let Ok(maps) = context.hooks.try_read() else {
         let active = HOLD.with_borrow(|hold| hold.active_button() == Some(id));
         if active {
-            let _ = HOLD.with_borrow_mut(HoldState::cancel);
+            if pressed {
+                let _ = HOLD.with_borrow_mut(HoldState::cancel);
+            } else {
+                let _ = HOLD.with_borrow_mut(|hold| hold.cancel_on_release(id));
+            }
         }
         return if active && !pressed {
             EventDisposition::Suppress
@@ -485,7 +495,7 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
     } else {
         let matches = HOLD.with_borrow(|hold| hold.mode_matches(id, gesture.as_ref(), generation));
         if !matches && HOLD.with_borrow(|hold| hold.active_button() == Some(id)) {
-            let _ = HOLD.with_borrow_mut(HoldState::cancel);
+            let _ = HOLD.with_borrow_mut(|hold| hold.cancel_on_release(id));
             return EventDisposition::Suppress;
         }
         if let Some(output) = HOLD.with_borrow_mut(|hold| hold.end(id)) {
@@ -1000,6 +1010,57 @@ mod tests {
             );
             assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
         }
+    }
+
+    #[test]
+    fn projection_demotion_on_release_does_not_leave_a_tombstone() {
+        let (queue, actions) = sync_channel(1);
+        let context = HookContext {
+            hooks: Arc::new(RwLock::new(HookMaps {
+                generation: 1,
+                bindings: BTreeMap::from([(ButtonId::Back, Action::MouseBack)]),
+                gestures: BTreeMap::from([(
+                    ButtonId::Back,
+                    GestureMode::Pan(PanBinding {
+                        click: Action::SmartZoom,
+                    }),
+                )]),
+            })),
+            action_emitter: ActionEmitter { queue },
+            monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+            pan_emitter: PanEmitter::new(),
+            gesture_coordinator: GestureCoordinator::default(),
+            coordinate_with_hid: true,
+        };
+        let _ = HOLD.with_borrow_mut(HoldState::cancel);
+        assert_eq!(
+            handle_button(&context, ButtonId::Back, true),
+            EventDisposition::Suppress
+        );
+
+        let Ok(mut maps) = context.hooks.write() else {
+            panic!("hook maps");
+        };
+        maps.generation = 2;
+        maps.gestures.remove(&ButtonId::Back);
+        drop(maps);
+        assert_eq!(
+            handle_button(&context, ButtonId::Back, false),
+            EventDisposition::Suppress,
+            "the release belonging to the demoted hold is still consumed"
+        );
+        assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+        assert_eq!(
+            handle_button(&context, ButtonId::Back, true),
+            EventDisposition::PassThrough
+        );
+        assert_eq!(
+            handle_button(&context, ButtonId::Back, false),
+            EventDisposition::PassThrough,
+            "the stale release was already consumed and must not poison this fresh release"
+        );
+        assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
     }
 
     #[test]
