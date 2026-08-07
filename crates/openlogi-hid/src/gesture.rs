@@ -9,17 +9,17 @@
 //! its input-report stream, so all captured controls share this session.
 //!
 //! The session is transport-only — it has no opinion on what an input *does*.
-//! The GUI maps each [`CapturedInput`] to the user's bound action and dispatches
-//! it, mirroring how the CGEventTap hook handles the side buttons. The thumb
-//! wheel is special: diverting it stops native horizontal scroll, so the GUI
-//! re-synthesises scroll from the [`CapturedInput::Scroll`] deltas — the wheel
-//! is therefore only diverted when the user's thumbwheel config leaves its
-//! defaults (click bound, rotation rebound, or sensitivity changed).
+//! In particular, it preserves the gesture button's raw press/motion/release
+//! lifecycle so orchestration can interpret it without HID transport policy.
+//! The thumb wheel is special: diverting it stops native horizontal scroll, so
+//! the agent re-synthesises scroll from the [`CapturedInput::Scroll`] deltas —
+//! the wheel is therefore only diverted when the user's thumbwheel config
+//! leaves its defaults (click bound, rotation rebound, or sensitivity changed).
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use hidpp::{channel::HidppChannel, device::Device, protocol::v20};
-use openlogi_core::binding::{ButtonId, GestureDirection, SwipeAccumulator};
+use openlogi_core::binding::ButtonId;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -38,8 +38,19 @@ pub type CaptureChannel = Arc<RwLock<Option<SharedChannel>>>;
 /// One input captured from the active device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CapturedInput {
-    /// A completed gesture-button swipe.
-    Gesture(GestureDirection),
+    /// The dedicated gesture button transitioned from released to pressed.
+    GesturePressed,
+    /// Raw signed movement while the dedicated gesture button is held.
+    GestureMotion {
+        /// Horizontal delta (`+` = right, in the device's raw units).
+        delta_x: i16,
+        /// Vertical delta (`+` = down, in the device's raw units).
+        delta_y: i16,
+    },
+    /// The dedicated gesture button transitioned from pressed to released.
+    GestureReleased,
+    /// The capture session ended while the dedicated gesture button was held.
+    GestureCancelled,
     /// A diverted button was pressed — the DPI/ModeShift button
     /// ([`ButtonId::DpiToggle`]) or the thumb-wheel single tap
     /// ([`ButtonId::Thumbwheel`]).
@@ -71,8 +82,8 @@ pub enum GestureError {
 /// because the channel's read thread invokes the listener by shared reference.
 #[derive(Default)]
 struct CaptureAccum {
-    /// Mid-swipe state for the diverted dedicated gesture button (raw-XY).
-    swipe: SwipeAccumulator,
+    /// Whether the dedicated gesture control was held in the last event.
+    gesture_down: bool,
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
     dpi_down: bool,
@@ -163,6 +174,13 @@ pub async fn run_capture_session(
     let _ = shutdown.await;
 
     drop(listener);
+    // No falling-edge report can arrive after the listener is removed. Close
+    // an in-flight lifecycle explicitly so downstream gesture state cannot
+    // remain stuck when the session is stopped or otherwise torn down.
+    {
+        let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
+        cancel_active_gesture(&mut acc, &sink);
+    }
     if let Ok(mut slot) = channel_slot.write() {
         *slot = None;
     }
@@ -325,10 +343,9 @@ async fn enumerate_controls(
     Ok(controls)
 }
 
-/// Update `acc` and emit on a decoded `0x1b04` event: commit a gesture swipe the
-/// instant it crosses the threshold (mid-swipe, like Options+) rather than on
-/// release, and emit a [`ButtonId::DpiToggle`] press on the rising edge of any
-/// diverted DPI/ModeShift control.
+/// Update `acc` and emit the raw gesture lifecycle plus a
+/// [`ButtonId::DpiToggle`] press on the rising edge of any diverted
+/// DPI/ModeShift control.
 fn handle_reprog(
     acc: &mut CaptureAccum,
     event: RawControlEvent,
@@ -338,14 +355,12 @@ fn handle_reprog(
     match event {
         RawControlEvent::DivertedButtons(cids) => {
             let gesture_held = cids.contains(&reprog_controls::GESTURE_BUTTON_CID);
-            if gesture_held && !acc.swipe.is_holding() {
-                acc.swipe.begin();
-            } else if !gesture_held && acc.swipe.is_holding() {
-                // A press that never committed a direction is a plain click.
-                if acc.swipe.end() {
-                    debug!("gesture click");
-                    let _ = sink.send(CapturedInput::Gesture(GestureDirection::Click));
-                }
+            if gesture_held && !acc.gesture_down {
+                acc.gesture_down = true;
+                let _ = sink.send(CapturedInput::GesturePressed);
+            } else if !gesture_held && acc.gesture_down {
+                acc.gesture_down = false;
+                let _ = sink.send(CapturedInput::GestureReleased);
             }
 
             let dpi_down = dpi_cids.iter().any(|cid| cids.contains(cid));
@@ -355,14 +370,22 @@ fn handle_reprog(
             acc.dpi_down = dpi_down;
         }
         RawControlEvent::RawXy { dx, dy } => {
-            // Commit the instant a clean direction emerges (mid-swipe, once per
-            // hold); the accumulator gates on hold duration internally and drops
-            // travel that arrives outside a hold.
-            if let Some(direction) = acc.swipe.accumulate(i32::from(dx), i32::from(dy)) {
-                debug!(?direction, "gesture committed");
-                let _ = sink.send(CapturedInput::Gesture(direction));
+            if acc.gesture_down {
+                let _ = sink.send(CapturedInput::GestureMotion {
+                    delta_x: dx,
+                    delta_y: dy,
+                });
             }
         }
+    }
+}
+
+/// End an in-flight gesture without pretending the missing falling edge was a
+/// normal release.
+fn cancel_active_gesture(acc: &mut CaptureAccum, sink: &mpsc::UnboundedSender<CapturedInput>) {
+    if acc.gesture_down {
+        acc.gesture_down = false;
+        let _ = sink.send(CapturedInput::GestureCancelled);
     }
 }
 #[cfg(test)]

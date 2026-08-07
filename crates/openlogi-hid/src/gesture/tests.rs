@@ -9,54 +9,94 @@ fn release() -> RawControlEvent {
 }
 
 #[test]
-fn quick_tap_is_a_click_even_while_the_cursor_moves() {
+fn gesture_reports_raw_press_motion_and_release_lifecycle() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
 
     handle_reprog(&mut acc, press(), &[], &tx);
     handle_reprog(
         &mut acc,
-        RawControlEvent::RawXy { dx: 120, dy: 5 },
+        RawControlEvent::RawXy { dx: -120, dy: 5 },
         &[],
         &tx,
     );
     handle_reprog(&mut acc, release(), &[], &tx);
 
     assert_eq!(
-        rx.try_recv(),
-        Ok(CapturedInput::Gesture(GestureDirection::Click))
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed),
+            Ok(CapturedInput::GestureMotion {
+                delta_x: -120,
+                delta_y: 5,
+            }),
+            Ok(CapturedInput::GestureReleased),
+        ]
     );
-    assert!(
-        rx.try_recv().is_err(),
-        "a quick tap emits exactly one click"
-    );
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
-fn a_held_gesture_commits_a_swipe_and_does_not_also_click() {
+fn raw_motion_is_forwarded_only_while_the_gesture_cid_is_held() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
 
-    handle_reprog(&mut acc, press(), &[], &tx);
-    // Pretend the button has been held well past the swipe gate.
-    acc.swipe.backdate_hold_for_test();
     handle_reprog(
         &mut acc,
-        RawControlEvent::RawXy { dx: 120, dy: 5 },
+        RawControlEvent::RawXy { dx: 10, dy: -20 },
+        &[],
+        &tx,
+    );
+    assert!(rx.try_recv().is_err(), "motion before press is ignored");
+
+    handle_reprog(&mut acc, press(), &[], &tx);
+    handle_reprog(&mut acc, press(), &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 10, dy: -20 },
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, release(), &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 30, dy: 40 },
         &[],
         &tx,
     );
 
     assert_eq!(
-        rx.try_recv(),
-        Ok(CapturedInput::Gesture(GestureDirection::Right))
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed),
+            Ok(CapturedInput::GestureMotion {
+                delta_x: 10,
+                delta_y: -20,
+            }),
+            Ok(CapturedInput::GestureReleased),
+        ],
+        "a repeated held frame does not create another rising edge"
     );
+    assert!(rx.try_recv().is_err(), "motion after release is ignored");
+}
 
-    handle_reprog(&mut acc, release(), &[], &tx);
-    assert!(
-        rx.try_recv().is_err(),
-        "a committed swipe must not also click on release"
+#[test]
+fn stopping_an_active_gesture_cancels_it_once() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, press(), &[], &tx);
+    cancel_active_gesture(&mut acc, &tx);
+    cancel_active_gesture(&mut acc, &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed),
+            Ok(CapturedInput::GestureCancelled),
+        ]
     );
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]

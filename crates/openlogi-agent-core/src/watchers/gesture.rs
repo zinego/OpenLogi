@@ -312,23 +312,18 @@ fn dispatch(
     input: CapturedInput,
     accumulators: &mut WheelAccumulators,
     hook_maps: &SharedHookMaps,
-    gesture_bindings: &GestureBindings,
+    _gesture_bindings: &GestureBindings,
     dpi_cycle: &Arc<RwLock<DpiCycleState>>,
     capture: &CaptureChannel,
     thumbwheel_sensitivity: &ThumbwheelSensitivity,
 ) {
     match input {
-        CapturedInput::Gesture(direction) => {
-            let action = gesture_bindings
-                .read()
-                .ok()
-                .and_then(|guard| guard.get(&direction).cloned());
-            if let Some(action) = action {
-                debug!(?direction, action = %action.label(), "gesture → action");
-                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
-            } else {
-                debug!(?direction, "gesture with no binding — ignored");
-            }
+        CapturedInput::GesturePressed
+        | CapturedInput::GestureMotion { .. }
+        | CapturedInput::GestureReleased
+        | CapturedInput::GestureCancelled => {
+            // The pan lifecycle is consumed here by the integration change.
+            debug!(?input, "raw HID++ gesture lifecycle not yet dispatched");
         }
         CapturedInput::ButtonPressed(button) => {
             let action = hook_maps
