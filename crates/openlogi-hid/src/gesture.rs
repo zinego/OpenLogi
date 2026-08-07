@@ -82,6 +82,9 @@ pub enum GestureError {
 /// because the channel's read thread invokes the listener by shared reference.
 #[derive(Default)]
 struct CaptureAccum {
+    /// Whether teardown has closed this capture session. Listener callbacks
+    /// cloned before guard removal must not emit after this becomes true.
+    closed: bool,
     /// Whether the dedicated gesture control was held in the last event.
     gesture_down: bool,
     /// Whether any DPI/ModeShift control was held in the last event — for
@@ -142,12 +145,16 @@ pub async fn run_capture_session(
                 return;
             }
             let msg = v20::Message::from(raw);
+            // Teardown and every event emission are serialized by this lock:
+            // a callback cloned before listener removal either completes first
+            // or observes `closed` and emits nothing.
+            let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
+            if acc.closed {
+                return;
+            }
             if let Some(idx) = reprog_index
                 && let Some(event) = reprog_controls::decode_event(&msg, device_index, idx)
             {
-                // Recover the guard even if a prior holder panicked — the
-                // critical section is panic-free, so the data is consistent.
-                let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
                 handle_reprog(&mut acc, event, &dpi_set, &sink);
                 return;
             }
@@ -179,7 +186,7 @@ pub async fn run_capture_session(
     // remain stuck when the session is stopped or otherwise torn down.
     {
         let mut acc = accum.lock().unwrap_or_else(PoisonError::into_inner);
-        cancel_active_gesture(&mut acc, &sink);
+        close_capture(&mut acc, &sink);
     }
     if let Ok(mut slot) = channel_slot.write() {
         *slot = None;
@@ -352,6 +359,9 @@ fn handle_reprog(
     dpi_cids: &[u16],
     sink: &mpsc::UnboundedSender<CapturedInput>,
 ) {
+    if acc.closed {
+        return;
+    }
     match event {
         RawControlEvent::DivertedButtons(cids) => {
             let gesture_held = cids.contains(&reprog_controls::GESTURE_BUTTON_CID);
@@ -380,9 +390,13 @@ fn handle_reprog(
     }
 }
 
-/// End an in-flight gesture without pretending the missing falling edge was a
-/// normal release.
-fn cancel_active_gesture(acc: &mut CaptureAccum, sink: &mpsc::UnboundedSender<CapturedInput>) {
+/// Atomically close the capture and end an in-flight gesture without pretending
+/// the missing falling edge was a normal release.
+fn close_capture(acc: &mut CaptureAccum, sink: &mpsc::UnboundedSender<CapturedInput>) {
+    if acc.closed {
+        return;
+    }
+    acc.closed = true;
     if acc.gesture_down {
         acc.gesture_down = false;
         let _ = sink.send(CapturedInput::GestureCancelled);

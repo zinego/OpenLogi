@@ -81,13 +81,18 @@ fn raw_motion_is_forwarded_only_while_the_gesture_cid_is_held() {
 }
 
 #[test]
-fn stopping_an_active_gesture_cancels_it_once() {
+fn closing_an_active_capture_cancels_once_and_ignores_late_events() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut acc = CaptureAccum::default();
 
     handle_reprog(&mut acc, press(), &[], &tx);
-    cancel_active_gesture(&mut acc, &tx);
-    cancel_active_gesture(&mut acc, &tx);
+    close_capture(&mut acc, &tx);
+    close_capture(&mut acc, &tx);
+    // A listener callback can already hold a cloned callback list when its
+    // guard is dropped. Simulate that callback entering after teardown.
+    handle_reprog(&mut acc, press(), &[], &tx);
+    handle_reprog(&mut acc, RawControlEvent::RawXy { dx: 4, dy: -7 }, &[], &tx);
+    handle_reprog(&mut acc, release(), &[], &tx);
 
     assert_eq!(
         [rx.try_recv(), rx.try_recv()],
