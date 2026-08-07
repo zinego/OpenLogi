@@ -1365,26 +1365,28 @@ Right = "NextDesktop"
         fs::write(&path, current).expect("write schema v4 config");
 
         let cfg = Config::load_from_path(&path).expect("load schema v4");
-        let bindings = cfg.bindings_for("mouse");
-        assert!(matches!(
-            bindings.get(&ButtonId::Forward),
-            Some(Binding::Pan(_))
-        ));
-        assert!(matches!(
-            bindings.get(&ButtonId::Back),
-            Some(Binding::Gesture(_))
-        ));
+        let expected = BTreeMap::from([
+            (
+                ButtonId::Back,
+                Binding::Gesture(BTreeMap::from([
+                    (GestureDirection::Click, Action::MissionControl),
+                    (GestureDirection::Up, Action::MissionControl),
+                    (GestureDirection::Down, Action::AppExpose),
+                    (GestureDirection::Left, Action::PreviousDesktop),
+                    (GestureDirection::Right, Action::NextDesktop),
+                ])),
+            ),
+            (
+                ButtonId::Forward,
+                Binding::Pan(crate::binding::PanBinding {
+                    click: Action::SmartZoom,
+                }),
+            ),
+        ]);
+        assert_eq!(cfg.bindings_for("mouse"), expected);
 
         let restored = write_and_read(&cfg);
-        let restored_bindings = restored.bindings_for("mouse");
-        assert!(matches!(
-            restored_bindings.get(&ButtonId::Forward),
-            Some(Binding::Pan(_))
-        ));
-        assert!(matches!(
-            restored_bindings.get(&ButtonId::Back),
-            Some(Binding::Gesture(_))
-        ));
+        assert_eq!(restored.bindings_for("mouse"), expected);
     }
 
     #[test]

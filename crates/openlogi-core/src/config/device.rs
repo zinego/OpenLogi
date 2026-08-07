@@ -52,10 +52,10 @@ pub struct DeviceIdentity {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(from = "RawDeviceConfig")]
 pub struct DeviceConfig {
-    /// Schema-v3 owner value retained only until top-level migration consumes
-    /// it. It is never serialized and is not part of the live config API.
+    /// Raw obsolete owner value retained only until the schema-v3 migration
+    /// consumes it. It is never serialized or decoded by the live schema.
     #[serde(skip)]
-    legacy_gesture_owner: Option<LegacyGestureOwner>,
+    raw_legacy_gesture_owner: Option<toml::Value>,
     /// Last-known identity (name / kind / capabilities), captured while the
     /// device was online. Lets the UI render this device — with the right
     /// config panels — on a cold start before any probe, or while it sleeps.
@@ -122,10 +122,10 @@ fn is_false(b: &bool) -> bool {
 /// captures schema-v3 owner state. Never serialized (only [`DeviceConfig`] is).
 #[derive(Deserialize)]
 struct RawDeviceConfig {
-    /// Schema-v3's explicit single owner. Invalid values remain field-local
-    /// and lenient: they decode as absent rather than rejecting the document.
-    #[serde(default, deserialize_with = "deserialize_legacy_gesture_owner")]
-    gesture_owner: Option<LegacyGestureOwner>,
+    /// Obsolete owner captured without interpretation. Only the schema-v3
+    /// migration path decodes a valid string value.
+    #[serde(default)]
+    gesture_owner: Option<toml::Value>,
     #[serde(default)]
     identity: Option<DeviceIdentity>,
     /// v2 shape — present on already-migrated files; wins on any key collision.
@@ -185,7 +185,7 @@ impl From<RawDeviceConfig> for DeviceConfig {
         }
 
         DeviceConfig {
-            legacy_gesture_owner: raw.gesture_owner,
+            raw_legacy_gesture_owner: raw.gesture_owner,
             identity: raw.identity,
             bindings,
             per_app_bindings: raw.per_app_bindings,
@@ -205,31 +205,24 @@ enum LegacyGestureOwner {
     Button(ButtonId),
 }
 
-fn deserialize_legacy_gesture_owner<'de, D>(
-    deserializer: D,
-) -> Result<Option<LegacyGestureOwner>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let value = toml::Value::deserialize(deserializer)?;
-    let Some(value) = value.as_str() else {
-        return Ok(None);
-    };
+fn decode_legacy_gesture_owner(value: Option<&toml::Value>) -> Option<LegacyGestureOwner> {
+    let value = value.and_then(toml::Value::as_str)?;
     if value == "Off" {
-        return Ok(Some(LegacyGestureOwner::Off));
+        return Some(LegacyGestureOwner::Off);
     }
     let button = ButtonId::deserialize(
         serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
     )
     .ok();
-    Ok(button.map(LegacyGestureOwner::Button))
+    button.map(LegacyGestureOwner::Button)
 }
 
 impl DeviceConfig {
     /// Consume schema-v3's single-owner state without activating gesture maps
     /// that were dormant in that schema.
     pub(super) fn normalize_legacy_gesture_owner(&mut self) {
-        let owner = self.legacy_gesture_owner.take();
+        let owner = decode_legacy_gesture_owner(self.raw_legacy_gesture_owner.as_ref());
+        self.raw_legacy_gesture_owner = None;
         normalize_legacy_bindings(&mut self.bindings, owner);
         for overlay in self.per_app_bindings.values_mut() {
             normalize_legacy_bindings(overlay, owner);
