@@ -3,8 +3,9 @@
 //!
 //! Monitoring is **off by default**. The freeze-sensitive hook callback pays
 //! only a single relaxed atomic load per event while off (see the freeze-hazard
-//! note in `openlogi-hook`); it locks and pushes only once the GUI starts
-//! polling. The GUI enables monitoring implicitly by polling
+//! note in `openlogi-hook`); once the GUI starts polling it attempts one
+//! non-blocking buffer write and drops the monitor event on contention. The GUI
+//! enables monitoring implicitly by polling
 //! [`EventMonitor::poll`], and [`EventMonitor::run_idle_janitor`] turns it back
 //! off when polls stop — so a closed panel or a crashed GUI can't leave the
 //! callback doing buffer work forever.
@@ -47,9 +48,9 @@ impl EventMonitor {
         self.enabled.load(Ordering::Relaxed)
     }
 
-    /// Record a hook event, if monitoring is on. Pointer moves are dropped: they
-    /// arrive at pointer-motion rates and would evict every button/scroll event
-    /// from the bounded buffer before the GUI's next poll.
+    /// Record a hook event, if monitoring is on and the buffer is immediately
+    /// available. Pointer moves and events arriving during buffer contention are
+    /// dropped so the input callback can never wait on the debug monitor.
     pub fn record(&self, event: &MouseEvent) {
         if !self.enabled() {
             return;
@@ -68,7 +69,7 @@ impl EventMonitor {
             MouseEvent::CaptureInterrupted => MonitorEvent::CaptureInterrupted,
             MouseEvent::Moved { .. } => return,
         };
-        if let Ok(mut buf) = self.buf.lock() {
+        if let Ok(mut buf) = self.buf.try_lock() {
             if buf.len() == CAPACITY {
                 buf.pop_front();
             }
@@ -129,6 +130,31 @@ impl EventMonitor {
 mod tests {
     use super::*;
     use openlogi_core::binding::ButtonId;
+    use std::sync::mpsc;
+
+    #[test]
+    fn record_drops_on_buffer_contention_and_recovers_after_release() {
+        let monitor = std::sync::Arc::new(EventMonitor::default());
+        assert!(monitor.poll().is_empty());
+        let Ok(guard) = monitor.buf.lock() else {
+            panic!("monitor buffer lock");
+        };
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker_monitor = std::sync::Arc::clone(&monitor);
+        let worker = std::thread::spawn(move || {
+            worker_monitor.record(&MouseEvent::CaptureInterrupted);
+            let _ = done_tx.send(());
+        });
+
+        let result = done_rx.recv_timeout(Duration::from_millis(50));
+        drop(guard);
+        assert!(worker.join().is_ok(), "record worker panicked");
+        assert_eq!(result, Ok(()), "record must not wait for the buffer");
+        assert!(monitor.poll().is_empty(), "contended event must be dropped");
+
+        monitor.record(&MouseEvent::CaptureInterrupted);
+        assert_eq!(monitor.poll(), vec![MonitorEvent::CaptureInterrupted]);
+    }
 
     #[test]
     fn records_only_while_enabled_and_skips_moves() {

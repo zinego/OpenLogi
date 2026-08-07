@@ -73,22 +73,50 @@ struct SessionInput {
     input: CapturedInput,
 }
 
-fn take_current_input(message: &SessionInput, live_epoch: u64) -> Option<CapturedInput> {
-    (message.epoch == live_epoch).then_some(message.input)
+/// Monotonic generation shared by projection owners and the capture manager.
+#[derive(Clone, Default)]
+pub struct CaptureEpoch {
+    value: Arc<AtomicU64>,
+}
+
+impl CaptureEpoch {
+    pub(crate) fn current(&self) -> u64 {
+        self.value.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn invalidate(&self) {
+        self.value.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn take_current(&self, message: &SessionInput) -> Option<CapturedInput> {
+        (message.epoch == self.current()).then_some(message.input)
+    }
+}
+
+async fn forward_session_inputs(
+    epoch: u64,
+    mut source: mpsc::UnboundedReceiver<CapturedInput>,
+    target: mpsc::UnboundedSender<SessionInput>,
+) {
+    while let Some(input) = source.recv().await {
+        if target.send(SessionInput { epoch, input }).is_err() {
+            break;
+        }
+    }
 }
 
 /// Shared invalidation state for HID capture sessions.
 #[derive(Clone)]
 pub struct CaptureSessionControl {
     receiver_access: ReceiverAccess,
-    epoch: Arc<AtomicU64>,
+    epoch: CaptureEpoch,
 }
 
 impl CaptureSessionControl {
     /// Couple exclusive receiver ownership with the epoch that invalidates
     /// already-queued input from superseded sessions.
     #[must_use]
-    pub fn new(receiver_access: ReceiverAccess, epoch: Arc<AtomicU64>) -> Self {
+    pub fn new(receiver_access: ReceiverAccess, epoch: CaptureEpoch) -> Self {
         Self {
             receiver_access,
             epoch,
@@ -219,12 +247,12 @@ async fn manage(
     loop {
         tokio::select! {
             Some(message) = rx.recv() => {
-                let live_epoch = session_control.epoch.load(Ordering::Acquire);
+                let live_epoch = session_control.epoch.current();
                 let session_is_live = current
                     .as_ref()
                     .is_some_and(|(_, _, _, epoch)| *epoch == live_epoch);
                 let Some(input) = session_is_live
-                    .then(|| take_current_input(&message, live_epoch))
+                    .then(|| session_control.epoch.take_current(&message))
                     .flatten()
                 else {
                     dispatch_state.gesture.cancel();
@@ -260,7 +288,7 @@ async fn manage(
                     let divert_gesture = gesture_bindings
                         .read()
                         .is_ok_and(|state| state.mode.is_some());
-                    let input_epoch = session_control.epoch.load(Ordering::Acquire);
+                    let input_epoch = session_control.epoch.current();
                     target.map(|t| {
                         (
                             t,
@@ -282,7 +310,7 @@ async fn manage(
                 }
                 if current.is_some() {
                     if want.is_none() {
-                        session_control.epoch.fetch_add(1, Ordering::AcqRel);
+                        session_control.epoch.invalidate();
                     }
                     current = None;
                     continue;
@@ -299,15 +327,13 @@ async fn manage(
                         session_epoch,
                     ));
                     let (stop_tx, stop_rx) = oneshot::channel();
-                    let (sink, mut session_rx) = mpsc::unbounded_channel();
+                    let (sink, session_rx) = mpsc::unbounded_channel();
                     let tagged_sink = tx.clone();
-                    tokio::spawn(async move {
-                        while let Some(input) = session_rx.recv().await {
-                            if tagged_sink.send(SessionInput { epoch: session_epoch, input }).is_err() {
-                                break;
-                            }
-                        }
-                    });
+                    tokio::spawn(forward_session_inputs(
+                        session_epoch,
+                        session_rx,
+                        tagged_sink,
+                    ));
                     let slot = Arc::clone(&capture_channel);
                     let done = done_tx.clone();
                     tokio::spawn(async move {
@@ -340,10 +366,10 @@ async fn manage(
                 // The tick fires at most once per `TARGET_POLL`, which paces the
                 // respawn so a permanently failing device can't hot-loop. A stale
                 // epoch or a deliberate stop-to-idle is a no-op (see `should_rearm`).
-                let live_epoch = session_control.epoch.load(Ordering::Acquire);
+                let live_epoch = session_control.epoch.current();
                 if should_rearm(done_epoch, live_epoch, current.is_some()) {
                     warn!("capture session for the active device ended unexpectedly, re-arming");
-                    session_control.epoch.fetch_add(1, Ordering::AcqRel);
+                    session_control.epoch.invalidate();
                     dispatch_state.gesture.cancel();
                     current = None;
                     // Keep the `stop`/`current` invariant: the session already
@@ -654,35 +680,37 @@ mod tests {
 
     use openlogi_core::binding::{PAN_DEADZONE, PanBinding};
 
-    #[test]
-    fn stale_session_lifecycle_cannot_trigger_new_pan_binding() {
-        let mode = GestureMode::Pan(PanBinding {
-            click: Action::SmartZoom,
-        });
-        let mut gesture = GestureDispatchState::default();
-        gesture.cancel();
+    #[tokio::test]
+    async fn queued_old_sender_input_is_dropped_after_epoch_invalidation() {
+        let epoch = CaptureEpoch::default();
+        let old_epoch = epoch.current();
+        let (old_sender, old_receiver) = mpsc::unbounded_channel();
+        let (tagged_sender, mut tagged_receiver) = mpsc::unbounded_channel();
         let deadzone = i16::try_from(PAN_DEADZONE).unwrap_or_default();
-        let queued = [
-            CapturedInput::GesturePressed,
-            CapturedInput::GestureReleased,
-            CapturedInput::GesturePressed,
-            CapturedInput::GestureMotion {
-                delta_x: deadzone,
-                delta_y: -deadzone,
-            },
-            CapturedInput::GestureReleased,
-        ];
-        let mut outputs = Vec::new();
+        assert!(old_sender.send(CapturedInput::GesturePressed).is_ok());
+        assert!(old_sender.send(CapturedInput::GestureReleased).is_ok());
+        assert!(old_sender.send(CapturedInput::GesturePressed).is_ok());
+        assert!(
+            old_sender
+                .send(CapturedInput::GestureMotion {
+                    delta_x: deadzone,
+                    delta_y: -deadzone,
+                })
+                .is_ok()
+        );
+        assert!(old_sender.send(CapturedInput::GestureReleased).is_ok());
+        drop(old_sender);
 
-        for input in queued {
-            let tagged = SessionInput { epoch: 7, input };
-            if let Some(input) = take_current_input(&tagged, 8) {
-                outputs.push(advance_gesture(&mut gesture, 8, &mode, input));
+        epoch.invalidate();
+        forward_session_inputs(old_epoch, old_receiver, tagged_sender).await;
+
+        let mut accepted = Vec::new();
+        while let Some(message) = tagged_receiver.recv().await {
+            if let Some(input) = epoch.take_current(&message) {
+                accepted.push(input);
             }
         }
-
-        assert!(outputs.is_empty(), "stale input must not reach policy");
-        assert!(gesture.mode.is_none());
+        assert!(accepted.is_empty(), "old queued lifecycle must be dropped");
     }
 
     #[test]

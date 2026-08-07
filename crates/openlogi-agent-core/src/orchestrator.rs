@@ -11,7 +11,7 @@
 //! (still valid) values — exactly the GUI's "window never opened" behaviour.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use openlogi_core::config::{Config, ScrollResolution};
@@ -25,7 +25,7 @@ use crate::device_order::DeviceStableId;
 use crate::hook_runtime::{HookMaps, PanEmitter, SharedHookMaps};
 use crate::ipc::InventoryHealth;
 use crate::receiver_access::ReceiverAccess;
-use crate::watchers::gesture::{GestureBindingState, GestureBindings};
+use crate::watchers::gesture::{CaptureEpoch, GestureBindingState, GestureBindings};
 
 /// The minimal per-device facts the agent needs: the config key (binding /
 /// preset lookup), the HID++ route (DPI/SmartShift writes + capture target), and
@@ -62,7 +62,7 @@ pub struct SharedRuntime {
     pub pan_emitter: PanEmitter,
     /// Invalidates queued HID capture input whenever the active projection or
     /// capture session changes.
-    pub capture_epoch: Arc<AtomicU64>,
+    pub capture_epoch: CaptureEpoch,
     /// Exclusive receiver access shared by HID++ capture and pairing. Capture
     /// and pairing must never open the same receiver HID node concurrently.
     pub receiver_access: ReceiverAccess,
@@ -118,7 +118,7 @@ impl Orchestrator {
             )),
             capture_channel: Arc::new(RwLock::new(None)),
             pan_emitter: PanEmitter::new(),
-            capture_epoch: Arc::new(AtomicU64::new(0)),
+            capture_epoch: CaptureEpoch::default(),
             receiver_access: ReceiverAccess::default(),
         };
         let mut orch = Self {
@@ -167,7 +167,7 @@ impl Orchestrator {
     /// Rewrite every shared map from the current config + selected device.
     fn rebuild(&mut self) {
         self.gesture_generation = self.gesture_generation.wrapping_add(1);
-        self.shared.capture_epoch.fetch_add(1, Ordering::AcqRel);
+        self.shared.capture_epoch.invalidate();
         let key = self.current_key();
         // One write publishes both hook maps atomically, so a button press during
         // an owner switch can't observe a half-updated state.
@@ -362,7 +362,7 @@ impl Orchestrator {
         }
         self.current_app = bundle;
         self.gesture_generation = self.gesture_generation.wrapping_add(1);
-        self.shared.capture_epoch.fetch_add(1, Ordering::AcqRel);
+        self.shared.capture_epoch.invalidate();
         write_value(
             &self.shared.hook_maps,
             self.hook_maps_for(self.current_key(), self.current_app.as_deref()),
@@ -557,6 +557,29 @@ mod tests {
         ReceiverInfo,
     };
     use openlogi_hid::{DIRECT_DEVICE_INDEX, DeviceRoute};
+
+    #[test]
+    fn app_switch_and_rebuild_invalidate_capture_input_epoch() {
+        let mut orchestrator = Orchestrator::new(Config::default());
+        let initial = orchestrator.shared.capture_epoch.current();
+
+        orchestrator.set_current_app(Some("com.apple.Safari".to_string()));
+        let after_app_switch = orchestrator.shared.capture_epoch.current();
+        assert_ne!(after_app_switch, initial);
+
+        orchestrator.set_current_app(Some("com.apple.Safari".to_string()));
+        assert_eq!(
+            orchestrator.shared.capture_epoch.current(),
+            after_app_switch,
+            "an unchanged app projection must not invalidate the live session"
+        );
+
+        orchestrator.reload_config(Config::default());
+        assert_ne!(
+            orchestrator.shared.capture_epoch.current(),
+            after_app_switch
+        );
+    }
 
     fn dev(key: &str, slot: u8, online: bool) -> AgentDevice {
         AgentDevice {
