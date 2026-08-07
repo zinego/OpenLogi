@@ -256,7 +256,6 @@ async fn translate(
 mod tests {
     use super::*;
 
-    use std::collections::BTreeMap;
     use std::sync::RwLock;
 
     use openlogi_agent_core::DpiCycleState;
@@ -266,10 +265,13 @@ mod tests {
     fn shared_runtime() -> SharedRuntime {
         SharedRuntime {
             hook_maps: Arc::new(RwLock::new(HookMaps::default())),
-            gesture_bindings: Arc::new(RwLock::new(BTreeMap::new())),
+            gesture_bindings: Arc::new(RwLock::new(
+                openlogi_agent_core::watchers::gesture::GestureBindingState::default(),
+            )),
             dpi_cycle: Arc::new(RwLock::new(DpiCycleState::default())),
             thumbwheel_sensitivity: Arc::new(0.into()),
             capture_channel: Arc::new(RwLock::new(None)),
+            pan_emitter: openlogi_agent_core::hook_runtime::PanEmitter::new(),
             receiver_access: ReceiverAccess::default(),
         }
     }

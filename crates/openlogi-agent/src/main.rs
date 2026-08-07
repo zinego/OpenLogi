@@ -169,6 +169,7 @@ async fn run(config: Config) {
         shared.capture_channel.clone(),
         shared.thumbwheel_sensitivity.clone(),
         shared.receiver_access.clone(),
+        shared.pan_emitter.clone(),
     );
 
     let mut inventory_rx = watchers::inventory::spawn(Duration::from_secs(2));
@@ -234,6 +235,7 @@ async fn run(config: Config) {
                             shared.dpi_cycle.clone(),
                             shared.capture_channel.clone(),
                             Arc::clone(&event_monitor),
+                            shared.pan_emitter.clone(),
                         );
                         hook_installed.store(hook.is_some(), Ordering::Relaxed);
                     } else {

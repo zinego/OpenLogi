@@ -10,7 +10,7 @@
 //! [`DpiCycleState::capabilities`] stays `None` and presets cycle at their raw
 //! (still valid) values — exactly the GUI's "window never opened" behaviour.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -20,12 +20,12 @@ use openlogi_hid::{CaptureChannel, DeviceRoute};
 use tracing::warn;
 
 use crate::DpiCycleState;
-use crate::bindings::{bindings_for, gesture_bindings_for, oshook_gestures_for};
+use crate::bindings::{bindings_for, hid_gesture_for, oshook_gestures_for};
 use crate::device_order::DeviceStableId;
-use crate::hook_runtime::{HookMaps, SharedHookMaps};
+use crate::hook_runtime::{HookMaps, PanEmitter, SharedHookMaps};
 use crate::ipc::InventoryHealth;
 use crate::receiver_access::ReceiverAccess;
-use crate::watchers::gesture::GestureBindings;
+use crate::watchers::gesture::{GestureBindingState, GestureBindings};
 
 /// The minimal per-device facts the agent needs: the config key (binding /
 /// preset lookup), the HID++ route (DPI/SmartShift writes + capture target), and
@@ -58,6 +58,8 @@ pub struct SharedRuntime {
     pub dpi_cycle: Arc<RwLock<DpiCycleState>>,
     pub thumbwheel_sensitivity: Arc<AtomicI32>,
     pub capture_channel: CaptureChannel,
+    /// Non-blocking coalescing sink used by both gesture input paths.
+    pub pan_emitter: PanEmitter,
     /// Exclusive receiver access shared by HID++ capture and pairing. Capture
     /// and pairing must never open the same receiver HID node concurrently.
     pub receiver_access: ReceiverAccess,
@@ -69,6 +71,7 @@ pub struct Orchestrator {
     devices: Vec<AgentDevice>,
     current: usize,
     current_app: Option<String>,
+    gesture_generation: u64,
     /// The latest inventory snapshot, kept so the IPC server can answer the
     /// GUI's `inventory()` polls without re-enumerating (the agent owns all
     /// device I/O). The enum keeps "nothing checked yet" and "enumeration
@@ -105,19 +108,21 @@ impl Orchestrator {
     pub fn new(config: Config) -> Self {
         let shared = SharedRuntime {
             hook_maps: Arc::new(RwLock::new(HookMaps::default())),
-            gesture_bindings: Arc::new(RwLock::new(BTreeMap::new())),
+            gesture_bindings: Arc::new(RwLock::new(GestureBindingState::default())),
             dpi_cycle: Arc::new(RwLock::new(DpiCycleState::default())),
             thumbwheel_sensitivity: Arc::new(AtomicI32::new(
                 config.app_settings.thumbwheel_sensitivity,
             )),
             capture_channel: Arc::new(RwLock::new(None)),
+            pan_emitter: PanEmitter::new(),
             receiver_access: ReceiverAccess::default(),
         };
-        let orch = Self {
+        let mut orch = Self {
             config,
             devices: Vec::new(),
             current: 0,
             current_app: None,
+            gesture_generation: 0,
             inventory: InventoryState::Pending,
             reapply_all_next_refresh: false,
             reapply_followup: HashSet::new(),
@@ -149,13 +154,15 @@ impl Orchestrator {
     /// `rebuild` and `set_current_app` from drifting into a half-populated write.
     fn hook_maps_for(&self, key: Option<&str>, app: Option<&str>) -> HookMaps {
         HookMaps {
+            generation: self.gesture_generation,
             bindings: bindings_for(&self.config, key, app),
             gestures: oshook_gestures_for(&self.config, key, app),
         }
     }
 
     /// Rewrite every shared map from the current config + selected device.
-    fn rebuild(&self) {
+    fn rebuild(&mut self) {
+        self.gesture_generation = self.gesture_generation.wrapping_add(1);
         let key = self.current_key();
         // One write publishes both hook maps atomically, so a button press during
         // an owner switch can't observe a half-updated state.
@@ -166,7 +173,10 @@ impl Orchestrator {
         );
         write_value(
             &self.shared.gesture_bindings,
-            gesture_bindings_for(&self.config, key),
+            GestureBindingState {
+                generation: self.gesture_generation,
+                mode: hid_gesture_for(&self.config, key, self.current_app.as_deref()),
+            },
             "gesture_bindings",
         );
         write_value(
@@ -346,10 +356,23 @@ impl Orchestrator {
             return;
         }
         self.current_app = bundle;
+        self.gesture_generation = self.gesture_generation.wrapping_add(1);
         write_value(
             &self.shared.hook_maps,
             self.hook_maps_for(self.current_key(), self.current_app.as_deref()),
             "hook_maps",
+        );
+        write_value(
+            &self.shared.gesture_bindings,
+            GestureBindingState {
+                generation: self.gesture_generation,
+                mode: hid_gesture_for(
+                    &self.config,
+                    self.current_key(),
+                    self.current_app.as_deref(),
+                ),
+            },
+            "gesture_bindings",
         );
     }
 

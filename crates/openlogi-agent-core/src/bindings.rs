@@ -7,9 +7,42 @@
 use std::collections::BTreeMap;
 
 use openlogi_core::binding::{
-    Action, Binding, ButtonId, GestureDirection, default_binding, default_gesture_binding,
+    Action, Binding, ButtonId, GestureDirection, PanBinding, default_binding,
+    default_gesture_binding,
 };
 use openlogi_core::config::Config;
+
+/// Runtime policy for one gesture-capable button.
+///
+/// Keeping Pan as a typed mode preserves its hold/release lifecycle; projecting
+/// it into an [`Action`] would lose continuous motion and cancellation semantics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GestureMode {
+    /// Existing click/four-direction swipe behavior.
+    Directional(BTreeMap<GestureDirection, Action>),
+    /// Continuous two-axis Pan behavior.
+    Pan(PanBinding),
+}
+
+fn gesture_mode(binding: Binding, fill_directional_defaults: bool) -> Option<GestureMode> {
+    match binding {
+        Binding::Single(_) => None,
+        Binding::Gesture(stored) => {
+            let mut directions = if fill_directional_defaults {
+                GestureDirection::ALL
+                    .iter()
+                    .copied()
+                    .map(|direction| (direction, default_gesture_binding(direction)))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+            directions.extend(stored);
+            Some(GestureMode::Directional(directions))
+        }
+        Binding::Pan(pan) => Some(GestureMode::Pan(pan)),
+    }
+}
 
 /// Effective per-button single-action map for the device `config_key`, with
 /// `app_bundle`'s per-app overlay applied. Unset buttons fall back to
@@ -18,7 +51,7 @@ use openlogi_core::config::Config;
 /// This is the map the OS hook and the HID++ button-press path consume, so a
 /// `Binding::Gesture` is projected to its `click_action()` — the gesture
 /// button's per-direction swipes are dispatched via the separate
-/// [`gesture_bindings_for`] map, not here.
+/// [`hid_gesture_for`] mode, not here.
 #[must_use]
 pub fn bindings_for(
     config: &Config,
@@ -50,10 +83,11 @@ pub fn bindings_for(
 /// Effective gesture bindings for the device `config_key`. Unset directions
 /// fall back to [`default_gesture_binding`].
 #[must_use]
-pub fn gesture_bindings_for(
+pub fn hid_gesture_for(
     config: &Config,
     config_key: Option<&str>,
-) -> BTreeMap<GestureDirection, Action> {
+    app_bundle: Option<&str>,
+) -> Option<GestureMode> {
     // The dedicated HID++ gesture button (CID 0x00c3) only gestures while it is the device's gesture
     // owner. When the user moves the role to an OS-hook button (Middle/Back/
     // Forward) or turns gestures off, return an empty map so the gesture watcher
@@ -61,27 +95,29 @@ pub fn gesture_bindings_for(
     // HID++ gesture button firing regardless of the selection.
     let owner = config_key.and_then(|key| config.gesture_owner(key));
     if owner != Some(ButtonId::GestureButton) {
-        return BTreeMap::new();
+        return None;
     }
-    let stored = config_key
-        .map(|key| config.gesture_bindings_for(key))
-        .unwrap_or_default();
-    let mut bindings: BTreeMap<GestureDirection, Action> = GestureDirection::ALL
-        .iter()
-        .copied()
-        .map(|d| (d, default_gesture_binding(d)))
-        .collect();
-    for (k, v) in stored {
-        bindings.insert(k, v);
-    }
-    bindings
+    let Some(key) = config_key else {
+        return Some(GestureMode::Directional(
+            GestureDirection::ALL
+                .iter()
+                .copied()
+                .map(|direction| (direction, default_gesture_binding(direction)))
+                .collect(),
+        ));
+    };
+    let binding = config
+        .effective_bindings(key, app_bundle)
+        .remove(&ButtonId::GestureButton)
+        .unwrap_or_else(|| Binding::Gesture(BTreeMap::new()));
+    gesture_mode(binding, true)
 }
 
 /// Per-direction maps for the OS-hook gesture buttons (Middle/Back/Forward in
 /// gesture mode) on `config_key`, with `app_bundle`'s per-app overlay applied,
 /// for the OS hook to resolve a hold+swipe.
 ///
-/// Unlike [`gesture_bindings_for`] (the dedicated HID++ gesture button, which
+/// Unlike [`hid_gesture_for`] (the dedicated HID++ gesture button, which
 /// seeds every direction from [`default_gesture_binding`] at projection time),
 /// this returns the owner's raw stored map. In practice that map is already
 /// fully populated — [`Config::set_gesture_owner`] seeds all five directions via
@@ -100,7 +136,7 @@ pub fn oshook_gestures_for(
     config: &Config,
     config_key: Option<&str>,
     app_bundle: Option<&str>,
-) -> BTreeMap<ButtonId, BTreeMap<GestureDirection, Action>> {
+) -> BTreeMap<ButtonId, GestureMode> {
     let Some(key) = config_key else {
         return BTreeMap::new();
     };
@@ -117,15 +153,57 @@ pub fn oshook_gestures_for(
     };
     // Read the per-app *effective* map: a per-app override replaces the owner with
     // a `Single`, dropping it from the gesture set for that app.
-    match config.effective_bindings(key, app_bundle).remove(&owner) {
-        Some(Binding::Gesture(map)) => BTreeMap::from([(owner, map)]),
-        _ => BTreeMap::new(),
-    }
+    config
+        .effective_bindings(key, app_bundle)
+        .remove(&owner)
+        .and_then(|binding| gesture_mode(binding, false))
+        .map_or_else(BTreeMap::new, |mode| BTreeMap::from([(owner, mode)]))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use openlogi_core::binding::{PanBinding, default_pan_binding};
+
+    #[test]
+    fn hid_gesture_projects_pan_and_per_app_directional_overlay() {
+        let mut cfg = Config::default();
+        cfg.set_binding("2b042", ButtonId::GestureButton, default_pan_binding());
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.apple.Safari",
+            ButtonId::GestureButton,
+            Some(Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Click,
+                Action::MissionControl,
+            )]))),
+        );
+
+        assert_eq!(
+            hid_gesture_for(&cfg, Some("2b042"), None),
+            Some(GestureMode::Pan(PanBinding {
+                click: Action::SmartZoom,
+            }))
+        );
+        assert!(matches!(
+            hid_gesture_for(&cfg, Some("2b042"), Some("com.apple.Safari")),
+            Some(GestureMode::Directional(_))
+        ));
+    }
+
+    #[test]
+    fn oshook_pan_owner_projects_as_typed_pan_not_an_action() {
+        let mut cfg = Config::default();
+        cfg.set_gesture_owner("2b042", ButtonId::Back);
+        cfg.set_binding("2b042", ButtonId::Back, default_pan_binding());
+
+        let modes = oshook_gestures_for(&cfg, Some("2b042"), None);
+        assert!(matches!(
+            modes.get(&ButtonId::Back),
+            Some(GestureMode::Pan(_))
+        ));
+    }
 
     #[test]
     fn click_less_gesture_keeps_default_click_in_projection() {
@@ -184,10 +262,10 @@ mod tests {
 
         let oshook = oshook_gestures_for(&cfg, Some("2b042"), None);
         assert_eq!(oshook.len(), 1, "only the gesture-mode Back belongs here");
-        assert_eq!(
-            oshook.get(&ButtonId::Back),
-            Some(&BTreeMap::from([(GestureDirection::Up, Action::Copy)]))
-        );
+        let Some(GestureMode::Directional(directions)) = oshook.get(&ButtonId::Back) else {
+            panic!("Back should project as directional");
+        };
+        assert_eq!(directions.get(&GestureDirection::Up), Some(&Action::Copy));
         assert!(!oshook.contains_key(&ButtonId::MiddleClick));
         assert!(!oshook.contains_key(&ButtonId::GestureButton));
     }
@@ -226,18 +304,20 @@ mod tests {
     fn gesture_bindings_silent_when_hidpp_button_is_not_the_owner() {
         let mut cfg = Config::default();
         // Default device: the dedicated HID++ gesture button owns gestures, so its defaults are seeded.
-        let defaults = gesture_bindings_for(&cfg, Some("2b042"));
+        let Some(GestureMode::Directional(defaults)) = hid_gesture_for(&cfg, Some("2b042"), None)
+        else {
+            panic!("the default owner should be directional");
+        };
         assert_eq!(
             defaults.get(&GestureDirection::Up),
-            Some(&default_gesture_binding(GestureDirection::Up)),
-            "the default gesture owner is the dedicated HID++ gesture button"
+            Some(&default_gesture_binding(GestureDirection::Up))
         );
 
         // Move the gesture role to an OS-hook button: the HID++ gesture button goes silent,
         // so the watcher dispatches nothing for 0x00c3.
         cfg.set_gesture_owner("2b042", ButtonId::Back);
         assert!(
-            gesture_bindings_for(&cfg, Some("2b042")).is_empty(),
+            hid_gesture_for(&cfg, Some("2b042"), None).is_none(),
             "HID++ gesture button must dispatch nothing once another button owns gestures"
         );
     }

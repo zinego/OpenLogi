@@ -20,14 +20,14 @@
 //! the events arrive over HID++, and the bound action is synthesised the same
 //! way regardless.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use openlogi_core::binding::{
-    Action, ButtonId, GestureDirection, SwipeAccumulator, default_binding,
+    Action, ButtonId, GestureDirection, PanAccumulator, PanOutput, SwipeAccumulator,
+    default_binding,
 };
 use openlogi_core::config::DEFAULT_THUMBWHEEL_SENSITIVITY;
 use openlogi_hid::{CaptureChannel, CapturedInput, DeviceRoute, run_capture_session};
@@ -35,12 +35,21 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
 use crate::DpiCycleState;
-use crate::hook_runtime::{self, SharedHookMaps};
+use crate::bindings::GestureMode;
+use crate::hook_runtime::{self, PanEmitter, SharedHookMaps};
 use crate::receiver_access::ReceiverAccess;
 
 /// Shared gesture binding map, mirrored from `AppState` (keyed by click/swipe
 /// direction). The watcher reads it after interpreting the raw HID lifecycle.
-pub type GestureBindings = Arc<RwLock<BTreeMap<GestureDirection, Action>>>;
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GestureBindingState {
+    /// Projection generation; changes on config, app, or device rebuild.
+    pub generation: u64,
+    /// Active dedicated-button policy, or `None` when HID gesture capture is off.
+    pub mode: Option<GestureMode>,
+}
+
+pub type GestureBindings = Arc<RwLock<GestureBindingState>>;
 
 /// Shared thumb-wheel sensitivity, mirrored from `AppState`. Read on every wheel
 /// event; written only by `AppState::set_thumbwheel_sensitivity`.
@@ -85,6 +94,7 @@ pub fn spawn(
     capture_channel: CaptureChannel,
     thumbwheel_sensitivity: ThumbwheelSensitivity,
     receiver_access: ReceiverAccess,
+    pan_emitter: PanEmitter,
 ) {
     thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -104,6 +114,7 @@ pub fn spawn(
             capture_channel,
             thumbwheel_sensitivity,
             receiver_access,
+            pan_emitter,
         ));
     });
 }
@@ -155,6 +166,7 @@ async fn manage(
     capture_channel: CaptureChannel,
     thumbwheel_sensitivity: ThumbwheelSensitivity,
     receiver_access: ReceiverAccess,
+    pan_emitter: PanEmitter,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<CapturedInput>();
     // (route, capture_thumbwheel, divert_gesture_button)
@@ -179,11 +191,14 @@ async fn manage(
                 dispatch(
                     input,
                     &mut dispatch_state,
-                    &hook_maps,
-                    &gesture_bindings,
-                    &dpi_cycle,
-                    &capture_channel,
-                    &thumbwheel_sensitivity,
+                    &DispatchContext {
+                        hook_maps: &hook_maps,
+                        gesture_bindings: &gesture_bindings,
+                        dpi_cycle: &dpi_cycle,
+                        capture: &capture_channel,
+                        thumbwheel_sensitivity: &thumbwheel_sensitivity,
+                        pan_emitter: &pan_emitter,
+                    },
                 );
             }
             _ = ticker.tick() => {
@@ -200,7 +215,9 @@ async fn manage(
                     // gates on the owner), so it doubles as that signal — no need to
                     // thread the full config in. Re-evaluated each tick, so a
                     // ReloadConfig owner change restarts the session accordingly.
-                    let divert_gesture = gesture_bindings.read().is_ok_and(|g| !g.is_empty());
+                    let divert_gesture = gesture_bindings
+                        .read()
+                        .is_ok_and(|state| state.mode.is_some());
                     target.map(|t| {
                         (
                             t,
@@ -212,6 +229,7 @@ async fn manage(
                 if want == current {
                     continue;
                 }
+                dispatch_state.gesture.cancel();
                 // Target or thumb-wheel arming changed (or first tick): stop the
                 // old session and start one for the new state. Sending on the
                 // oneshot lets the old session restore the diverted controls.
@@ -266,6 +284,7 @@ async fn manage(
                 // epoch or a deliberate stop-to-idle is a no-op (see `should_rearm`).
                 if should_rearm(done_epoch, epoch, current.is_some()) {
                     warn!("capture session for the active device ended unexpectedly, re-arming");
+                    dispatch_state.gesture.cancel();
                     current = None;
                     // Keep the `stop`/`current` invariant: the session already
                     // exited, so its stop receiver is gone and dropping the sender
@@ -290,8 +309,32 @@ struct WheelAccumulators {
 /// Mutable input interpretation state owned by the capture watcher.
 #[derive(Default)]
 struct CaptureDispatchState {
-    gesture: SwipeAccumulator,
+    gesture: GestureDispatchState,
     wheels: WheelAccumulators,
+}
+
+#[derive(Default)]
+struct GestureDispatchState {
+    generation: u64,
+    mode: Option<GestureMode>,
+    swipe: SwipeAccumulator,
+    pan: PanAccumulator,
+}
+
+impl GestureDispatchState {
+    fn cancel(&mut self) {
+        let _ = self.swipe.end();
+        let _ = self.pan.cancel();
+        self.mode = None;
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum GestureOutput {
+    Idle,
+    Action(Action),
+    PanDelta { x: i32, y: i32 },
+    End,
 }
 
 /// Running state for one rotation direction.
@@ -319,42 +362,52 @@ enum WheelOutput {
 }
 
 /// Route one captured input to its bound action (or re-synthesised scroll).
-fn dispatch(
-    input: CapturedInput,
-    state: &mut CaptureDispatchState,
-    hook_maps: &SharedHookMaps,
-    gesture_bindings: &GestureBindings,
-    dpi_cycle: &Arc<RwLock<DpiCycleState>>,
-    capture: &CaptureChannel,
-    thumbwheel_sensitivity: &ThumbwheelSensitivity,
-) {
+struct DispatchContext<'a> {
+    hook_maps: &'a SharedHookMaps,
+    gesture_bindings: &'a GestureBindings,
+    dpi_cycle: &'a Arc<RwLock<DpiCycleState>>,
+    capture: &'a CaptureChannel,
+    thumbwheel_sensitivity: &'a ThumbwheelSensitivity,
+    pan_emitter: &'a PanEmitter,
+}
+
+fn dispatch(input: CapturedInput, state: &mut CaptureDispatchState, context: &DispatchContext<'_>) {
     match input {
         CapturedInput::GesturePressed
         | CapturedInput::GestureMotion { .. }
         | CapturedInput::GestureReleased
         | CapturedInput::GestureCancelled => {
-            let Some(direction) = advance_gesture(&mut state.gesture, input) else {
-                return;
-            };
-            let action = gesture_bindings
+            let projection = context
+                .gesture_bindings
                 .read()
                 .ok()
-                .and_then(|guard| guard.get(&direction).cloned());
-            if let Some(action) = action {
-                debug!(?direction, action = %action.label(), "gesture → action");
-                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
-            } else {
-                debug!(?direction, "gesture with no binding — ignored");
+                .map(|guard| guard.clone());
+            let Some(GestureBindingState {
+                generation,
+                mode: Some(mode),
+            }) = projection
+            else {
+                state.gesture.cancel();
+                return;
+            };
+            match advance_gesture(&mut state.gesture, generation, &mode, input) {
+                GestureOutput::Action(action) => {
+                    debug!(action = %action.label(), "gesture → action");
+                    hook_runtime::dispatch_action(&action, context.dpi_cycle, context.capture);
+                }
+                GestureOutput::PanDelta { x, y } => context.pan_emitter.emit(x, y),
+                GestureOutput::Idle | GestureOutput::End => {}
             }
         }
         CapturedInput::ButtonPressed(button) => {
-            let action = hook_maps
+            let action = context
+                .hook_maps
                 .read()
                 .ok()
                 .and_then(|maps| maps.bindings.get(&button).cloned());
             if let Some(action) = action {
                 debug!(?button, action = %action.label(), "HID++ button → action");
-                hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+                hook_runtime::dispatch_action(&action, context.dpi_cycle, context.capture);
             } else {
                 debug!(?button, "HID++ button with no binding — ignored");
             }
@@ -367,12 +420,13 @@ fn dispatch(
             } else {
                 ButtonId::ThumbwheelScrollDown
             };
-            let action = hook_maps
+            let action = context
+                .hook_maps
                 .read()
                 .ok()
                 .and_then(|maps| maps.bindings.get(&button).cloned())
                 .unwrap_or_else(|| default_binding(button));
-            let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
+            let sensitivity = context.thumbwheel_sensitivity.load(Ordering::Relaxed);
             let dir = if up {
                 &mut state.wheels.up
             } else {
@@ -386,7 +440,7 @@ fn dispatch(
                 }
                 WheelOutput::FireAction => {
                     debug!(?button, action = %action.label(), "thumb wheel → action");
-                    hook_runtime::dispatch_action(&action, dpi_cycle, capture);
+                    hook_runtime::dispatch_action(&action, context.dpi_cycle, context.capture);
                 }
             }
         }
@@ -397,23 +451,71 @@ fn dispatch(
 /// motion; release produces a click only when no direction committed; cancel
 /// only resets the hold.
 fn advance_gesture(
-    gesture: &mut SwipeAccumulator,
+    gesture: &mut GestureDispatchState,
+    generation: u64,
+    mode: &GestureMode,
     input: CapturedInput,
-) -> Option<GestureDirection> {
+) -> GestureOutput {
     match input {
         CapturedInput::GesturePressed => {
-            gesture.begin();
-            None
+            gesture.cancel();
+            gesture.generation = generation;
+            gesture.mode = Some(mode.clone());
+            match mode {
+                GestureMode::Directional(_) => gesture.swipe.begin(),
+                GestureMode::Pan(_) => gesture.pan.begin(),
+            }
+            GestureOutput::Idle
         }
         CapturedInput::GestureMotion { delta_x, delta_y } => {
-            gesture.accumulate(i32::from(delta_x), i32::from(delta_y))
+            if gesture.generation != generation || gesture.mode.as_ref() != Some(mode) {
+                gesture.cancel();
+                return GestureOutput::End;
+            }
+            match mode {
+                GestureMode::Directional(directions) => gesture
+                    .swipe
+                    .accumulate(i32::from(delta_x), i32::from(delta_y))
+                    .and_then(|direction| directions.get(&direction).cloned())
+                    .map_or(GestureOutput::Idle, GestureOutput::Action),
+                GestureMode::Pan(_) => match gesture
+                    .pan
+                    .accumulate(i32::from(delta_x), i32::from(delta_y))
+                {
+                    PanOutput::Delta { x, y } => GestureOutput::PanDelta { x, y },
+                    PanOutput::Idle | PanOutput::Click | PanOutput::End => GestureOutput::Idle,
+                },
+            }
         }
-        CapturedInput::GestureReleased => gesture.end().then_some(GestureDirection::Click),
+        CapturedInput::GestureReleased => {
+            if gesture.generation != generation || gesture.mode.as_ref() != Some(mode) {
+                gesture.cancel();
+                return GestureOutput::Idle;
+            }
+            gesture.mode = None;
+            match mode {
+                GestureMode::Directional(directions) => {
+                    if gesture.swipe.end() {
+                        directions
+                            .get(&GestureDirection::Click)
+                            .cloned()
+                            .map_or(GestureOutput::Idle, GestureOutput::Action)
+                    } else {
+                        GestureOutput::End
+                    }
+                }
+                GestureMode::Pan(pan) => match gesture.pan.end() {
+                    PanOutput::Click => GestureOutput::Action(pan.click.clone()),
+                    PanOutput::End => GestureOutput::End,
+                    PanOutput::Idle | PanOutput::Delta { .. } => GestureOutput::Idle,
+                },
+            }
+        }
         CapturedInput::GestureCancelled => {
-            let _ = gesture.end();
-            None
+            gesture.cancel();
+            GestureOutput::End
         }
-        CapturedInput::ButtonPressed(_) | CapturedInput::Scroll(_) => None,
+        CapturedInput::ButtonPressed(_) | CapturedInput::Scroll(_) => GestureOutput::Idle,
     }
 }
 
@@ -488,63 +590,154 @@ fn advance(
 mod tests {
     use super::*;
 
+    use std::collections::BTreeMap;
+
+    use openlogi_core::binding::{PAN_DEADZONE, PanBinding};
+
     #[test]
-    fn gesture_quick_motion_releases_as_click() {
-        let mut gesture = SwipeAccumulator::default();
+    fn hid_pan_lifecycle_emits_delta_then_ends_without_click() {
+        let mode = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
-            None
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
         );
         assert_eq!(
             advance_gesture(
                 &mut gesture,
+                1,
+                &mode,
+                CapturedInput::GestureMotion {
+                    delta_x: 4,
+                    delta_y: -9,
+                },
+            ),
+            GestureOutput::PanDelta {
+                x: PAN_DEADZONE,
+                y: -9,
+            }
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::End
+        );
+    }
+
+    #[test]
+    fn hid_pan_release_inside_deadzone_dispatches_click_but_cancel_does_not() {
+        let mode = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let mut gesture = GestureDispatchState::default();
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Action(Action::SmartZoom)
+        );
+
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureCancelled),
+            GestureOutput::End
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Idle
+        );
+    }
+
+    #[test]
+    fn hid_projection_generation_change_cancels_without_click() {
+        let mode = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let mut gesture = GestureDispatchState::default();
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(&mut gesture, 2, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Idle
+        );
+        assert!(gesture.mode.is_none());
+    }
+
+    #[test]
+    fn gesture_quick_motion_releases_as_click() {
+        let mode =
+            GestureMode::Directional(BTreeMap::from([(GestureDirection::Click, Action::Copy)]));
+        let mut gesture = GestureDispatchState::default();
+
+        assert_eq!(
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &mode,
                 CapturedInput::GestureMotion {
                     delta_x: 120,
                     delta_y: 5,
                 }
             ),
-            None,
+            GestureOutput::Idle,
             "motion before the hold gate remains a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
-            Some(GestureDirection::Click)
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Action(Action::Copy)
         );
     }
 
     #[test]
     fn gesture_motion_maps_all_four_directions_once() {
-        for (delta_x, delta_y, expected) in [
-            (120, 5, GestureDirection::Right),
-            (-120, 5, GestureDirection::Left),
-            (5, 120, GestureDirection::Down),
-            (5, -120, GestureDirection::Up),
+        for (delta_x, delta_y, direction, expected) in [
+            (120, 5, GestureDirection::Right, Action::Paste),
+            (-120, 5, GestureDirection::Left, Action::Copy),
+            (5, 120, GestureDirection::Down, Action::AppExpose),
+            (5, -120, GestureDirection::Up, Action::MissionControl),
         ] {
-            let mut gesture = SwipeAccumulator::default();
+            let mode = GestureMode::Directional(BTreeMap::from([(direction, expected.clone())]));
+            let mut gesture = GestureDispatchState::default();
             assert_eq!(
-                advance_gesture(&mut gesture, CapturedInput::GesturePressed),
-                None
+                advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+                GestureOutput::Idle
             );
-            gesture.backdate_hold_for_test();
+            gesture.swipe.backdate_hold_for_test();
             assert_eq!(
                 advance_gesture(
                     &mut gesture,
+                    1,
+                    &mode,
                     CapturedInput::GestureMotion { delta_x, delta_y }
                 ),
-                Some(expected)
+                GestureOutput::Action(expected)
             );
             assert_eq!(
                 advance_gesture(
                     &mut gesture,
+                    1,
+                    &mode,
                     CapturedInput::GestureMotion { delta_x, delta_y }
                 ),
-                None,
+                GestureOutput::Idle,
                 "a committed direction fires once"
             );
             assert_eq!(
-                advance_gesture(&mut gesture, CapturedInput::GestureReleased),
-                None,
+                advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+                GestureOutput::End,
                 "a committed swipe does not also click"
             );
         }
@@ -552,33 +745,35 @@ mod tests {
 
     #[test]
     fn gesture_release_and_cancel_reset_without_phantom_clicks() {
-        let mut gesture = SwipeAccumulator::default();
+        let mode =
+            GestureMode::Directional(BTreeMap::from([(GestureDirection::Click, Action::Copy)]));
+        let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
-            None,
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Idle,
             "a stray release is not a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
-            None
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GestureCancelled),
-            None
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureCancelled),
+            GestureOutput::End
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
-            None,
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Idle,
             "release after cancellation is not a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GesturePressed),
-            None
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, CapturedInput::GestureReleased),
-            Some(GestureDirection::Click),
+            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            GestureOutput::Action(Action::Copy),
             "cancellation resets the accumulator for the next hold"
         );
     }
