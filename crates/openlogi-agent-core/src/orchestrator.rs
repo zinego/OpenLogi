@@ -20,7 +20,7 @@ use openlogi_hid::{CaptureChannel, DeviceRoute};
 use tracing::warn;
 
 use crate::DpiCycleState;
-use crate::bindings::{bindings_for, hid_gesture_for, oshook_gestures_for};
+use crate::bindings::{bindings_for, hid_gestures_for, oshook_gestures_for};
 use crate::device_order::DeviceStableId;
 use crate::gesture_coordinator::GestureCoordinator;
 use crate::hook_runtime::{HookMaps, PanEmitter, SharedHookMaps};
@@ -184,7 +184,7 @@ impl Orchestrator {
             &self.shared.gesture_bindings,
             GestureBindingState {
                 generation: self.gesture_generation,
-                mode: hid_gesture_for(&self.config, key, self.current_app.as_deref()),
+                modes: hid_gestures_for(&self.config, key, self.current_app.as_deref()),
             },
             "gesture_bindings",
         );
@@ -374,7 +374,7 @@ impl Orchestrator {
             &self.shared.gesture_bindings,
             GestureBindingState {
                 generation: self.gesture_generation,
-                mode: hid_gesture_for(
+                modes: hid_gestures_for(
                     &self.config,
                     self.current_key(),
                     self.current_app.as_deref(),

@@ -50,7 +50,7 @@ fn gesture_mode(binding: Binding, fill_directional_defaults: bool) -> Option<Ges
 ///
 /// This is the map the OS hook and the HID++ button-press path consume, so a
 /// `Binding::Gesture` is projected to its `click_action()` — hold/motion/release
-/// is dispatched through [`hid_gesture_for`] or [`oshook_gestures_for`].
+/// is dispatched through [`hid_gestures_for`] or [`oshook_gestures_for`].
 #[must_use]
 pub fn bindings_for(
     config: &Config,
@@ -97,12 +97,51 @@ pub fn hid_gesture_for(
     gesture_mode(binding, true)
 }
 
+/// Effective typed gesture modes that the HID++ capture session must divert.
+///
+/// The dedicated gesture control keeps its canonical directional default. The
+/// three buttons that are also visible to the OS hook are included only when
+/// their effective global/per-app binding is typed as [`Binding::Gesture`] or
+/// [`Binding::Pan`]. A [`Binding::Single`] overlay therefore removes just that
+/// button from HID diversion while leaving the other gesture buttons armed.
+#[must_use]
+pub fn hid_gestures_for(
+    config: &Config,
+    config_key: Option<&str>,
+    app_bundle: Option<&str>,
+) -> BTreeMap<ButtonId, GestureMode> {
+    let mut modes = BTreeMap::from([(
+        ButtonId::GestureButton,
+        GestureMode::Directional(
+            GestureDirection::ALL
+                .iter()
+                .copied()
+                .map(|direction| (direction, default_gesture_binding(direction)))
+                .collect(),
+        ),
+    )]);
+    let Some(key) = config_key else {
+        return modes;
+    };
+    for (button, binding) in config.effective_bindings(key, app_bundle) {
+        if !button.is_os_hook_button() && button != ButtonId::GestureButton {
+            continue;
+        }
+        if let Some(mode) = gesture_mode(binding, button == ButtonId::GestureButton) {
+            modes.insert(button, mode);
+        } else {
+            modes.remove(&button);
+        }
+    }
+    modes
+}
+
 /// Per-direction maps for the OS-hook gesture buttons (Middle/Back/Forward in
 /// gesture mode) on `config_key`, with `app_bundle`'s per-app overlay applied,
 /// for the OS hook to resolve a hold+swipe.
 ///
-/// Unlike [`hid_gesture_for`] (the dedicated HID++ gesture button, which
-/// seeds every direction from [`default_gesture_binding`] at projection time),
+/// Unlike the dedicated HID++ gesture-button entry in [`hid_gestures_for`]
+/// (which seeds every direction from [`default_gesture_binding`] at projection time),
 /// this returns each button's raw stored map. A hand-edited sparse map leaves a
 /// direction unbound, in which case the OS-hook runtime uses the map's click
 /// action (or the button's native default when Click is also absent) as its
@@ -160,6 +199,62 @@ mod tests {
             hid_gesture_for(&cfg, Some("2b042"), Some("com.apple.Safari")),
             Some(GestureMode::Directional(_))
         ));
+    }
+
+    #[test]
+    fn hid_gestures_route_back_directional_and_forward_pan_together() {
+        let mut cfg = Config::default();
+        cfg.set_binding(
+            "2b042",
+            ButtonId::Back,
+            Binding::Gesture(BTreeMap::from([
+                (GestureDirection::Click, Action::MissionControl),
+                (GestureDirection::Left, Action::PreviousDesktop),
+            ])),
+        );
+        cfg.set_binding("2b042", ButtonId::Forward, default_pan_binding());
+
+        let modes = hid_gestures_for(&cfg, Some("2b042"), None);
+
+        assert_eq!(modes.len(), 3, "the dedicated default remains capturable");
+        assert!(matches!(
+            modes.get(&ButtonId::Back),
+            Some(GestureMode::Directional(directions))
+                if directions.get(&GestureDirection::Click) == Some(&Action::MissionControl)
+                    && directions.get(&GestureDirection::Left) == Some(&Action::PreviousDesktop)
+        ));
+        assert_eq!(
+            modes.get(&ButtonId::Forward),
+            Some(&GestureMode::Pan(PanBinding {
+                click: Action::SmartZoom,
+            }))
+        );
+        assert!(matches!(
+            modes.get(&ButtonId::GestureButton),
+            Some(GestureMode::Directional(_))
+        ));
+    }
+
+    #[test]
+    fn hid_gestures_per_app_single_removes_only_overridden_button() {
+        let mut cfg = Config::default();
+        cfg.set_binding("2b042", ButtonId::Back, default_pan_binding());
+        cfg.set_binding("2b042", ButtonId::Forward, default_pan_binding());
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.apple.Safari",
+            ButtonId::Back,
+            Some(Binding::Single(Action::BrowserBack)),
+        );
+
+        let modes = hid_gestures_for(&cfg, Some("2b042"), Some("com.apple.Safari"));
+
+        assert!(!modes.contains_key(&ButtonId::Back));
+        assert!(matches!(
+            modes.get(&ButtonId::Forward),
+            Some(GestureMode::Pan(_))
+        ));
+        assert!(modes.contains_key(&ButtonId::GestureButton));
     }
 
     #[test]

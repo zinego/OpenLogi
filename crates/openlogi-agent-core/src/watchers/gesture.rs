@@ -5,9 +5,9 @@
 //! ([`DpiCycleState::target`]), restarts it when the carousel selection — or the
 //! thumb-wheel arming — changes, and dispatches each captured input:
 //!
-//! - the raw gesture-button lifecycle through a watcher-owned
+//! - each raw gesture-button lifecycle through a watcher-owned
 //!   [`openlogi_core::binding::SwipeAccumulator`], dispatching a configured
-//!   click or four-direction swipe through the gesture binding map,
+//!   click, four-direction swipe, or Pan stream through its button's typed mode,
 //! - a DPI/ModeShift or thumb-wheel-tap press through the button binding map,
 //! - thumb-wheel rotation through the [`ButtonId::ThumbwheelScrollUp`] /
 //!   [`ButtonId::ThumbwheelScrollDown`] bindings — either re-synthesised as
@@ -20,6 +20,7 @@
 //! the events arrive over HID++, and the bound action is synthesised the same
 //! way regardless.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -30,7 +31,9 @@ use openlogi_core::binding::{
     default_binding,
 };
 use openlogi_core::config::DEFAULT_THUMBWHEEL_SENSITIVITY;
-use openlogi_hid::{CaptureChannel, CapturedInput, DeviceRoute, run_capture_session};
+use openlogi_hid::{
+    CaptureChannel, CaptureRequest, CapturedInput, DeviceRoute, run_capture_session,
+};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -46,8 +49,8 @@ use crate::receiver_access::ReceiverAccess;
 pub struct GestureBindingState {
     /// Projection generation; changes on config, app, or device rebuild.
     pub generation: u64,
-    /// Active dedicated-button policy, or `None` when HID gesture capture is off.
-    pub mode: Option<GestureMode>,
+    /// Effective typed policy for every control diverted through HID++.
+    pub modes: BTreeMap<ButtonId, GestureMode>,
 }
 
 pub type GestureBindings = Arc<RwLock<GestureBindingState>>;
@@ -207,6 +210,19 @@ fn thumbwheel_armed(hook_maps: &SharedHookMaps, sensitivity: i32) -> bool {
     })
 }
 
+/// Build the transport request from the effective typed gesture projection.
+/// Keeping this value comparable lets the manager restart the live HID++
+/// session whenever one button enters or leaves gesture mode.
+fn capture_request(
+    capture_thumbwheel: bool,
+    modes: &BTreeMap<ButtonId, GestureMode>,
+) -> CaptureRequest {
+    CaptureRequest {
+        capture_thumbwheel,
+        gesture_buttons: modes.keys().copied().collect::<BTreeSet<_>>(),
+    }
+}
+
 /// Whether a finished capture session should make the manager re-arm.
 ///
 /// `done_epoch` identifies the session that signalled completion; `live_epoch`
@@ -236,8 +252,8 @@ async fn manage(
     session_control: CaptureSessionControl,
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<SessionInput>();
-    // (route, capture_thumbwheel, divert_gesture_button, input epoch)
-    let mut current: Option<(DeviceRoute, bool, bool, u64)> = None;
+    // (route, complete transport request, input epoch)
+    let mut current: Option<(DeviceRoute, CaptureRequest, u64)> = None;
     let mut stop: Option<oneshot::Sender<()>> = None;
     let mut ticker = tokio::time::interval(TARGET_POLL);
     let mut dispatch_state = CaptureDispatchState {
@@ -260,7 +276,7 @@ async fn manage(
                 let live_epoch = session_control.epoch.current();
                 let session_is_live = current
                     .as_ref()
-                    .is_some_and(|(_, _, _, epoch)| *epoch == live_epoch);
+                    .is_some_and(|(_, _, epoch)| *epoch == live_epoch);
                 let Some(input) = session_is_live
                     .then(|| session_control.epoch.take_current(&message))
                     .flatten()
@@ -290,21 +306,19 @@ async fn manage(
                 } else {
                     let target = dpi_cycle.read().ok().and_then(|guard| guard.target.clone());
                     let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
-                    // Divert the dedicated HID++ gesture button only while its
-                    // effective binding is typed as Gesture or Pan. Re-evaluated
-                    // each tick, so a config reload can re-arm capture.
-                    let divert_gesture = gesture_bindings
+                    // Divert every control whose effective binding is typed as
+                    // Gesture or Pan. Re-evaluated each tick, so per-app and
+                    // config changes re-arm precisely the affected buttons.
+                    let modes = gesture_bindings
                         .read()
-                        .is_ok_and(|state| state.mode.is_some());
+                        .map(|state| state.modes.clone())
+                        .unwrap_or_default();
+                    let request = capture_request(
+                        thumbwheel_armed(&hook_maps, sensitivity),
+                        &modes,
+                    );
                     let input_epoch = session_control.epoch.current();
-                    target.map(|t| {
-                        (
-                            t,
-                            thumbwheel_armed(&hook_maps, sensitivity),
-                            divert_gesture,
-                            input_epoch,
-                        )
-                    })
+                    target.map(|t| (t, request, input_epoch))
                 };
                 if want == current {
                     continue;
@@ -323,15 +337,14 @@ async fn manage(
                     current = None;
                     continue;
                 }
-                if let Some((route, capture_thumbwheel, divert_gesture_button, session_epoch)) = want {
+                if let Some((route, request, session_epoch)) = want {
                     let Some(receiver_lease) = session_control.receiver_access.try_acquire_for_capture() else {
                         current = None;
                         continue;
                     };
                     current = Some((
                         route.clone(),
-                        capture_thumbwheel,
-                        divert_gesture_button,
+                        request.clone(),
                         session_epoch,
                     ));
                     let (stop_tx, stop_rx) = oneshot::channel();
@@ -348,8 +361,7 @@ async fn manage(
                         let _receiver_lease = receiver_lease;
                         if let Err(e) = run_capture_session(
                             route,
-                            capture_thumbwheel,
-                            divert_gesture_button,
+                            request,
                             sink,
                             stop_rx,
                             slot,
@@ -412,6 +424,7 @@ struct GestureDispatchState {
     coordinator: GestureCoordinator,
     generation: u64,
     token: Option<GestureToken>,
+    button: Option<ButtonId>,
     mode: Option<GestureMode>,
     swipe: SwipeAccumulator,
     pan: PanAccumulator,
@@ -428,6 +441,7 @@ impl GestureDispatchState {
     fn cancel(&mut self) {
         let _ = self.swipe.end();
         let _ = self.pan.cancel();
+        self.button = None;
         self.mode = None;
         self.token = None;
     }
@@ -477,24 +491,20 @@ struct DispatchContext<'a> {
 
 fn dispatch(input: CapturedInput, state: &mut CaptureDispatchState, context: &DispatchContext<'_>) {
     match input {
-        CapturedInput::GesturePressed
+        CapturedInput::GesturePressed(_)
         | CapturedInput::GestureMotion { .. }
-        | CapturedInput::GestureReleased
-        | CapturedInput::GestureCancelled => {
+        | CapturedInput::GestureReleased(_)
+        | CapturedInput::GestureCancelled(_) => {
             let projection = context
                 .gesture_bindings
                 .read()
                 .ok()
                 .map(|guard| guard.clone());
-            let Some(GestureBindingState {
-                generation,
-                mode: Some(mode),
-            }) = projection
-            else {
+            let Some(GestureBindingState { generation, modes }) = projection else {
                 state.gesture.cancel();
                 return;
             };
-            match advance_gesture(&mut state.gesture, generation, &mode, input) {
+            match advance_gesture(&mut state.gesture, generation, &modes, input) {
                 GestureOutput::Action(action) => {
                     debug!(action = %action.label(), "gesture → action");
                     hook_runtime::dispatch_action(&action, context.dpi_cycle, context.capture);
@@ -554,17 +564,38 @@ fn dispatch(input: CapturedInput, state: &mut CaptureDispatchState, context: &Di
 /// Interpret one raw HID++ gesture event. Directional swipes commit once during
 /// motion; release produces a click only when no direction committed; cancel
 /// only resets the hold.
+fn gesture_is_current(
+    gesture: &GestureDispatchState,
+    generation: u64,
+    button: ButtonId,
+    mode: &GestureMode,
+) -> bool {
+    gesture.button == Some(button)
+        && gesture.generation == generation
+        && gesture.mode.as_ref() == Some(mode)
+        && gesture
+            .token
+            .is_some_and(|token| gesture.coordinator.is_current(token))
+}
+
 fn advance_gesture(
     gesture: &mut GestureDispatchState,
     generation: u64,
-    mode: &GestureMode,
+    modes: &BTreeMap<ButtonId, GestureMode>,
     input: CapturedInput,
 ) -> GestureOutput {
     match input {
-        CapturedInput::GesturePressed => {
+        CapturedInput::GesturePressed(button) => {
+            let Some(mode) = modes.get(&button) else {
+                if gesture.button == Some(button) {
+                    gesture.cancel();
+                }
+                return GestureOutput::Idle;
+            };
             gesture.cancel();
             gesture.generation = generation;
             gesture.token = Some(gesture.coordinator.acquire());
+            gesture.button = Some(button);
             gesture.mode = Some(mode.clone());
             match mode {
                 GestureMode::Directional(_) => gesture.swipe.begin(),
@@ -572,13 +603,19 @@ fn advance_gesture(
             }
             GestureOutput::Idle
         }
-        CapturedInput::GestureMotion { delta_x, delta_y } => {
-            if gesture.generation != generation
-                || gesture.mode.as_ref() != Some(mode)
-                || !gesture
-                    .token
-                    .is_some_and(|token| gesture.coordinator.is_current(token))
-            {
+        CapturedInput::GestureMotion {
+            button,
+            delta_x,
+            delta_y,
+        } => {
+            if gesture.button != Some(button) {
+                return GestureOutput::Idle;
+            }
+            let Some(mode) = modes.get(&button) else {
+                gesture.cancel();
+                return GestureOutput::End;
+            };
+            if !gesture_is_current(gesture, generation, button, mode) {
                 gesture.cancel();
                 return GestureOutput::End;
             }
@@ -597,16 +634,19 @@ fn advance_gesture(
                 },
             }
         }
-        CapturedInput::GestureReleased => {
-            if gesture.generation != generation
-                || gesture.mode.as_ref() != Some(mode)
-                || !gesture
-                    .token
-                    .is_some_and(|token| gesture.coordinator.is_current(token))
-            {
+        CapturedInput::GestureReleased(button) => {
+            if gesture.button != Some(button) {
+                return GestureOutput::Idle;
+            }
+            let Some(mode) = modes.get(&button) else {
+                gesture.cancel();
+                return GestureOutput::Idle;
+            };
+            if !gesture_is_current(gesture, generation, button, mode) {
                 gesture.cancel();
                 return GestureOutput::Idle;
             }
+            gesture.button = None;
             gesture.mode = None;
             gesture.token = None;
             match mode {
@@ -627,9 +667,13 @@ fn advance_gesture(
                 },
             }
         }
-        CapturedInput::GestureCancelled => {
-            gesture.cancel();
-            GestureOutput::End
+        CapturedInput::GestureCancelled(button) => {
+            if gesture.button == Some(button) {
+                gesture.cancel();
+                GestureOutput::End
+            } else {
+                GestureOutput::Idle
+            }
         }
         CapturedInput::ButtonPressed(_) | CapturedInput::Scroll(_) => GestureOutput::Idle,
     }
@@ -710,6 +754,215 @@ mod tests {
 
     use openlogi_core::binding::{PAN_DEADZONE, PanBinding};
 
+    const GESTURE_BUTTON: ButtonId = ButtonId::GestureButton;
+
+    fn advance_mode(
+        gesture: &mut GestureDispatchState,
+        generation: u64,
+        mode: &GestureMode,
+        input: CapturedInput,
+    ) -> GestureOutput {
+        let button = match input {
+            CapturedInput::GesturePressed(button)
+            | CapturedInput::GestureReleased(button)
+            | CapturedInput::GestureCancelled(button)
+            | CapturedInput::GestureMotion { button, .. } => button,
+            CapturedInput::ButtonPressed(_) | CapturedInput::Scroll(_) => GESTURE_BUTTON,
+        };
+        advance_gesture(
+            gesture,
+            generation,
+            &BTreeMap::from([(button, mode.clone())]),
+            input,
+        )
+    }
+
+    fn gesture_pressed() -> CapturedInput {
+        CapturedInput::GesturePressed(GESTURE_BUTTON)
+    }
+
+    fn gesture_released() -> CapturedInput {
+        CapturedInput::GestureReleased(GESTURE_BUTTON)
+    }
+
+    fn gesture_cancelled() -> CapturedInput {
+        CapturedInput::GestureCancelled(GESTURE_BUTTON)
+    }
+
+    fn gesture_motion(delta_x: i16, delta_y: i16) -> CapturedInput {
+        CapturedInput::GestureMotion {
+            button: GESTURE_BUTTON,
+            delta_x,
+            delta_y,
+        }
+    }
+
+    #[test]
+    fn capture_request_changes_when_one_gesture_button_changes() {
+        let back = GestureMode::Directional(BTreeMap::from([(
+            GestureDirection::Click,
+            Action::MissionControl,
+        )]));
+        let pan = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let back_only = BTreeMap::from([(ButtonId::Back, back.clone())]);
+        let both = BTreeMap::from([(ButtonId::Back, back), (ButtonId::Forward, pan)]);
+
+        let before = capture_request(false, &back_only);
+        let after = capture_request(false, &both);
+
+        assert_ne!(before, after, "the session key must observe the button set");
+        assert_eq!(
+            after.gesture_buttons,
+            BTreeSet::from([ButtonId::Back, ButtonId::Forward])
+        );
+        assert!(!after.capture_thumbwheel);
+    }
+
+    #[test]
+    fn newest_button_press_owns_lifecycle_and_stale_release_is_ignored() {
+        let forward = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let back = GestureMode::Directional(BTreeMap::from([(
+            GestureDirection::Click,
+            Action::MissionControl,
+        )]));
+        let mut gesture = GestureDispatchState::default();
+
+        assert_eq!(
+            advance_mode(
+                &mut gesture,
+                1,
+                &forward,
+                CapturedInput::GesturePressed(ButtonId::Forward),
+            ),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_mode(
+                &mut gesture,
+                1,
+                &back,
+                CapturedInput::GesturePressed(ButtonId::Back),
+            ),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_mode(
+                &mut gesture,
+                1,
+                &forward,
+                CapturedInput::GestureReleased(ButtonId::Forward),
+            ),
+            GestureOutput::Idle,
+            "the superseded button cannot release the newest hold"
+        );
+        assert_eq!(gesture.button, Some(ButtonId::Back));
+        assert_eq!(
+            advance_mode(
+                &mut gesture,
+                1,
+                &back,
+                CapturedInput::GestureReleased(ButtonId::Back),
+            ),
+            GestureOutput::Action(Action::MissionControl)
+        );
+    }
+
+    #[test]
+    fn keyed_back_motion_and_forward_pan_use_independent_modes() {
+        let back = GestureMode::Directional(BTreeMap::from([(
+            GestureDirection::Left,
+            Action::PreviousDesktop,
+        )]));
+        let forward = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let modes = BTreeMap::from([(ButtonId::Back, back), (ButtonId::Forward, forward)]);
+        let mut gesture = GestureDispatchState::default();
+
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GesturePressed(ButtonId::Forward),
+            ),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GestureReleased(ButtonId::Forward),
+            ),
+            GestureOutput::Action(Action::SmartZoom),
+            "Forward Pan keeps its click fallback"
+        );
+
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GesturePressed(ButtonId::Back),
+            ),
+            GestureOutput::Idle
+        );
+        gesture.swipe.backdate_hold_for_test();
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GestureMotion {
+                    button: ButtonId::Back,
+                    delta_x: -120,
+                    delta_y: 0,
+                },
+            ),
+            GestureOutput::Action(Action::PreviousDesktop)
+        );
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GestureReleased(ButtonId::Back),
+            ),
+            GestureOutput::End
+        );
+
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GesturePressed(ButtonId::Forward),
+            ),
+            GestureOutput::Idle
+        );
+        assert_eq!(
+            advance_gesture(
+                &mut gesture,
+                1,
+                &modes,
+                CapturedInput::GestureMotion {
+                    button: ButtonId::Forward,
+                    delta_x: 4,
+                    delta_y: -9,
+                },
+            ),
+            GestureOutput::PanDelta {
+                x: PAN_DEADZONE,
+                y: -9,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn queued_old_sender_input_is_dropped_after_epoch_invalidation() {
         let epoch = CaptureEpoch::default();
@@ -717,18 +970,11 @@ mod tests {
         let (old_sender, old_receiver) = mpsc::unbounded_channel();
         let (tagged_sender, mut tagged_receiver) = mpsc::unbounded_channel();
         let deadzone = i16::try_from(PAN_DEADZONE).unwrap_or_default();
-        assert!(old_sender.send(CapturedInput::GesturePressed).is_ok());
-        assert!(old_sender.send(CapturedInput::GestureReleased).is_ok());
-        assert!(old_sender.send(CapturedInput::GesturePressed).is_ok());
-        assert!(
-            old_sender
-                .send(CapturedInput::GestureMotion {
-                    delta_x: deadzone,
-                    delta_y: -deadzone,
-                })
-                .is_ok()
-        );
-        assert!(old_sender.send(CapturedInput::GestureReleased).is_ok());
+        assert!(old_sender.send(gesture_pressed()).is_ok());
+        assert!(old_sender.send(gesture_released()).is_ok());
+        assert!(old_sender.send(gesture_pressed()).is_ok());
+        assert!(old_sender.send(gesture_motion(deadzone, -deadzone)).is_ok());
+        assert!(old_sender.send(gesture_released()).is_ok());
         drop(old_sender);
 
         epoch.invalidate();
@@ -751,26 +997,18 @@ mod tests {
         let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(
-                &mut gesture,
-                1,
-                &mode,
-                CapturedInput::GestureMotion {
-                    delta_x: 4,
-                    delta_y: -9,
-                },
-            ),
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(4, -9)),
             GestureOutput::PanDelta {
                 x: PAN_DEADZONE,
                 y: -9,
             }
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::End
         );
     }
@@ -782,24 +1020,24 @@ mod tests {
         });
         let mut gesture = GestureDispatchState::default();
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Action(Action::SmartZoom)
         );
 
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureCancelled),
+            advance_mode(&mut gesture, 1, &mode, gesture_cancelled()),
             GestureOutput::End
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Idle
         );
     }
@@ -811,11 +1049,11 @@ mod tests {
         });
         let mut gesture = GestureDispatchState::default();
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 2, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 2, &mode, gesture_released()),
             GestureOutput::Idle
         );
         assert!(gesture.mode.is_none());
@@ -829,25 +1067,17 @@ mod tests {
         });
         let mut gesture = GestureDispatchState::new(coordinator.clone());
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
 
         let _os = coordinator.acquire();
         assert_eq!(
-            advance_gesture(
-                &mut gesture,
-                1,
-                &mode,
-                CapturedInput::GestureMotion {
-                    delta_x: 40,
-                    delta_y: -20,
-                },
-            ),
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(40, -20)),
             GestureOutput::End
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Idle
         );
     }
@@ -861,26 +1091,18 @@ mod tests {
         });
         let mut gesture = GestureDispatchState::new(coordinator.clone());
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(
-                &mut gesture,
-                1,
-                &mode,
-                CapturedInput::GestureMotion {
-                    delta_x: 4,
-                    delta_y: -9,
-                },
-            ),
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(4, -9)),
             GestureOutput::PanDelta {
                 x: PAN_DEADZONE,
                 y: -9,
             }
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::End
         );
     }
@@ -892,24 +1114,16 @@ mod tests {
         let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(
-                &mut gesture,
-                1,
-                &mode,
-                CapturedInput::GestureMotion {
-                    delta_x: 120,
-                    delta_y: 5,
-                }
-            ),
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(120, 5)),
             GestureOutput::Idle,
             "motion before the hold gate remains a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Action(Action::Copy)
         );
     }
@@ -925,31 +1139,21 @@ mod tests {
             let mode = GestureMode::Directional(BTreeMap::from([(direction, expected.clone())]));
             let mut gesture = GestureDispatchState::default();
             assert_eq!(
-                advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+                advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
                 GestureOutput::Idle
             );
             gesture.swipe.backdate_hold_for_test();
             assert_eq!(
-                advance_gesture(
-                    &mut gesture,
-                    1,
-                    &mode,
-                    CapturedInput::GestureMotion { delta_x, delta_y }
-                ),
+                advance_mode(&mut gesture, 1, &mode, gesture_motion(delta_x, delta_y)),
                 GestureOutput::Action(expected)
             );
             assert_eq!(
-                advance_gesture(
-                    &mut gesture,
-                    1,
-                    &mode,
-                    CapturedInput::GestureMotion { delta_x, delta_y }
-                ),
+                advance_mode(&mut gesture, 1, &mode, gesture_motion(delta_x, delta_y)),
                 GestureOutput::Idle,
                 "a committed direction fires once"
             );
             assert_eq!(
-                advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+                advance_mode(&mut gesture, 1, &mode, gesture_released()),
                 GestureOutput::End,
                 "a committed swipe does not also click"
             );
@@ -963,29 +1167,29 @@ mod tests {
         let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Idle,
             "a stray release is not a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureCancelled),
+            advance_mode(&mut gesture, 1, &mode, gesture_cancelled()),
             GestureOutput::End
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Idle,
             "release after cancellation is not a click"
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GesturePressed),
+            advance_mode(&mut gesture, 1, &mode, gesture_pressed()),
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_gesture(&mut gesture, 1, &mode, CapturedInput::GestureReleased),
+            advance_mode(&mut gesture, 1, &mode, gesture_released()),
             GestureOutput::Action(Action::Copy),
             "cancellation resets the accumulator for the next hold"
         );
