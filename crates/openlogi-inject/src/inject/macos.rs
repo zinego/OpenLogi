@@ -30,7 +30,6 @@ const VK_V: u16 = 0x09;
 const VK_W: u16 = 0x0D;
 const VK_X: u16 = 0x07;
 const VK_Z: u16 = 0x06;
-const VK_EQUAL: u16 = 0x18;
 const VK_TAB: u16 = 0x30;
 
 /// macOS implementation: dispatch to the appropriate event helper.
@@ -90,14 +89,7 @@ pub(super) fn execute(action: &Action) {
         Action::NextDesktop => next_desktop(),
         Action::ShowDesktop => show_desktop(),
         Action::LaunchpadShow => launchpad(),
-        // macOS exposes Smart Magnify only as an AppKit responder event, not
-        // as a public cross-application injection API. Use the documented,
-        // repeatable webpage zoom-in shortcut instead. This intentionally
-        // increments zoom on every press rather than toggling around a point.
-        Action::SmartZoom => {
-            let (key_code, flags) = smart_zoom_shortcut();
-            post_key(key_code, flags);
-        }
+        Action::SmartZoom => post_smart_zoom(),
         // ── System ────────────────────────────────────────────────────────
         // Lock screen = Cmd+Ctrl+Q (kVK_ANSI_Q = 0x0C)
         Action::LockScreen => post_key(0x0C, cmd | ctrl),
@@ -293,11 +285,63 @@ fn post_media_key(nx_key: i32) {
     });
 }
 
-fn smart_zoom_shortcut() -> (u16, CGEventFlags) {
-    (
-        VK_EQUAL,
-        CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift,
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SmartZoomEventPlan {
+    event_type: u32,
+    event_subtype_field: u32,
+    event_subtype: i64,
+    iohid_event_type_field: u32,
+    iohid_event_type: i64,
+}
+
+fn smart_zoom_event_plan() -> SmartZoomEventPlan {
+    SmartZoomEventPlan {
+        // NSEventTypeGesture. Unlike NSEventTypeSmartMagnify (32), 29 is a
+        // valid CoreGraphics event type accepted by WindowServer.
+        event_type: 29,
+        // Private CGEvent field carrying the AppKit event subtype.
+        event_subtype_field: 55,
+        event_subtype: 29,
+        // Private CGEvent field carrying the embedded IOHID event type.
+        iohid_event_type_field: 110,
+        // kIOHIDEventTypeZoomToggle.
+        iohid_event_type: 22,
+    }
+}
+
+fn post_smart_zoom() {
+    use objc2_core_graphics::{CGEvent, CGEventTapLocation};
+
+    let Some(event) = new_smart_zoom_event() else {
+        tracing::warn!("CGEvent creation failed for Smart Zoom");
+        return;
+    };
+    CGEvent::post(CGEventTapLocation::HIDEventTap, Some(&event));
+}
+
+/// Construct and stamp the gesture/IOHID Zoom Toggle event without posting it.
+fn new_smart_zoom_event() -> Option<impl std::ops::Deref<Target = objc2_core_graphics::CGEvent>> {
+    use objc2_core_graphics::{CGEvent, CGEventField, CGEventType};
+
+    let plan = smart_zoom_event_plan();
+    let event = CGEvent::new(None)?;
+    CGEvent::set_type(Some(&event), CGEventType(plan.event_type));
+    CGEvent::set_integer_value_field(
+        Some(&event),
+        CGEventField(plan.event_subtype_field),
+        plan.event_subtype,
+    );
+    CGEvent::set_integer_value_field(
+        Some(&event),
+        CGEventField(plan.iohid_event_type_field),
+        plan.iohid_event_type,
+    );
+    CGEvent::set_integer_value_field(
+        Some(&event),
+        CGEventField::EventSourceUserData,
+        super::SYNTHETIC_EVENT_USER_DATA,
+    );
+    Some(event)
 }
 
 /// Post a synthetic scroll event for `action` (one of the `Scroll*` variants).
@@ -607,16 +651,37 @@ mod symbolic_hotkey {
 
 #[cfg(test)]
 mod tests {
-    use super::smart_zoom_shortcut;
-    use core_graphics::event::CGEventFlags;
+    use super::{new_smart_zoom_event, smart_zoom_event_plan};
+    use objc2_core_graphics::{CGEvent, CGEventField};
 
     #[test]
-    fn smart_zoom_uses_repeatable_command_plus_shortcut() {
-        let (key_code, flags) = smart_zoom_shortcut();
-        assert_eq!(key_code, 0x18);
+    fn smart_zoom_plan_matches_zoom_toggle_protocol() {
+        let plan = smart_zoom_event_plan();
+        assert_eq!(plan.event_type, 29);
+        assert_eq!(plan.event_subtype_field, 55);
+        assert_eq!(plan.event_subtype, 29);
+        assert_eq!(plan.iohid_event_type_field, 110);
+        assert_eq!(plan.iohid_event_type, 22);
+    }
+
+    #[test]
+    fn smart_zoom_event_contains_gesture_zoom_toggle_fields_without_posting() {
+        let Some(event) = new_smart_zoom_event() else {
+            panic!("CoreGraphics must construct a Smart Zoom event");
+        };
+        let plan = smart_zoom_event_plan();
+        assert_eq!(CGEvent::r#type(Some(&event)).0, 29);
         assert_eq!(
-            flags,
-            CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagShift
+            CGEvent::integer_value_field(Some(&event), CGEventField(plan.event_subtype_field)),
+            29
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField(plan.iohid_event_type_field)),
+            22
+        );
+        assert_eq!(
+            CGEvent::integer_value_field(Some(&event), CGEventField::EventSourceUserData),
+            super::super::SYNTHETIC_EVENT_USER_DATA
         );
     }
 }
