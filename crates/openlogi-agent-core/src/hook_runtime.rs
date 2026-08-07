@@ -103,6 +103,7 @@ struct HoldState {
     generation: u64,
     coordinator: GestureCoordinator,
     token: Option<GestureToken>,
+    cancelled_releases: u8,
     gesture: Option<HoldGesture>,
 }
 
@@ -112,6 +113,7 @@ impl HoldState {
         if self.button.is_some_and(|active| active != button) {
             let _ = self.cancel();
         }
+        self.cancelled_releases &= !release_bit(button);
         self.button = Some(button);
         self.generation = generation;
         self.token = Some(self.coordinator.acquire());
@@ -170,6 +172,13 @@ impl HoldState {
 
     fn coordinate_with(&mut self, coordinator: GestureCoordinator) {
         self.coordinator = coordinator;
+    }
+
+    fn consume_cancelled_release(&mut self, button: ButtonId) -> bool {
+        let bit = release_bit(button);
+        let cancelled = self.cancelled_releases & bit != 0;
+        self.cancelled_releases &= !bit;
+        cancelled
     }
 
     /// Feed a pointer-move delta into the active hold, tagging a committed swipe
@@ -241,6 +250,9 @@ impl HoldState {
     /// interrupts capture. A dropped button-up would otherwise leave a stale hold
     /// that the next stray pointer move turns into a phantom swipe.
     fn cancel(&mut self) -> HoldOutput {
+        if let Some(button) = self.button {
+            self.cancelled_releases |= release_bit(button);
+        }
         self.button = None;
         self.token = None;
         if let Some(HoldGesture::Pan { accumulator, .. }) = self.gesture.as_mut() {
@@ -248,6 +260,15 @@ impl HoldState {
         }
         self.gesture = None;
         HoldOutput::Suppress
+    }
+}
+
+fn release_bit(button: ButtonId) -> u8 {
+    match button {
+        ButtonId::MiddleClick => 1 << 0,
+        ButtonId::Back => 1 << 1,
+        ButtonId::Forward => 1 << 2,
+        _ => 0,
     }
 }
 
@@ -385,6 +406,7 @@ pub fn start(
         monitor,
         pan_emitter,
         gesture_coordinator,
+        coordinate_with_hid: cfg!(not(target_os = "linux")),
     };
     // The per-hold pointer accumulator lives in the thread-local `HOLD`; the
     // callback must never block — see the freeze-hazard note in `macos.rs`.
@@ -408,6 +430,10 @@ struct HookContext {
     monitor: SharedEventMonitor,
     pan_emitter: PanEmitter,
     gesture_coordinator: GestureCoordinator,
+    /// Linux runs one callback thread per physical evdev device. Until those
+    /// events carry a selected logical-device identity, keep each thread's OS
+    /// token local instead of letting one mouse invalidate another.
+    coordinate_with_hid: bool,
 }
 
 fn handle_event(context: &HookContext, event: &MouseEvent) -> EventDisposition {
@@ -426,6 +452,9 @@ fn handle_event(context: &HookContext, event: &MouseEvent) -> EventDisposition {
 fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDisposition {
     if !id.is_os_hook_button() {
         return EventDisposition::PassThrough;
+    }
+    if !pressed && HOLD.with_borrow_mut(|hold| hold.consume_cancelled_release(id)) {
+        return EventDisposition::Suppress;
     }
     let Ok(maps) = context.hooks.try_read() else {
         let active = HOLD.with_borrow(|hold| hold.active_button() == Some(id));
@@ -446,7 +475,9 @@ fn handle_button(context: &HookContext, id: ButtonId, pressed: bool) -> EventDis
     if pressed {
         if let Some(gesture) = gesture {
             HOLD.with_borrow_mut(|hold| {
-                hold.coordinate_with(context.gesture_coordinator.clone());
+                if context.coordinate_with_hid {
+                    hold.coordinate_with(context.gesture_coordinator.clone());
+                }
                 hold.begin(id, gesture, generation);
             });
             return EventDisposition::Suppress;
@@ -589,6 +620,7 @@ mod tests {
     use super::*;
     use openlogi_core::binding::{GESTURE_SWIPE_THRESHOLD, PAN_DEADZONE, PanBinding};
     use std::sync::mpsc;
+    use std::sync::{Arc, Barrier};
     use std::time::Duration;
 
     fn pan_hook_context() -> HookContext {
@@ -608,6 +640,7 @@ mod tests {
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
             gesture_coordinator: GestureCoordinator::default(),
+            coordinate_with_hid: true,
         }
     }
 
@@ -624,6 +657,7 @@ mod tests {
                 monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
                 pan_emitter: PanEmitter::new(),
                 gesture_coordinator: GestureCoordinator::default(),
+                coordinate_with_hid: true,
             },
             actions,
         )
@@ -698,6 +732,7 @@ mod tests {
             monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
             pan_emitter: PanEmitter::new(),
             gesture_coordinator: GestureCoordinator::default(),
+            coordinate_with_hid: true,
         };
         assert_eq!(
             handle_button(&directional_context, ButtonId::Back, true),
@@ -907,11 +942,16 @@ mod tests {
     #[test]
     fn dedicated_press_invalidates_os_hold_without_phantom_click() {
         for button in [ButtonId::Back, ButtonId::Forward] {
-            let (queue, actions) = sync_channel(1);
+            let (queue, actions) = sync_channel(2);
+            let native = if button == ButtonId::Back {
+                Action::MouseBack
+            } else {
+                Action::MouseForward
+            };
             let context = HookContext {
                 hooks: Arc::new(RwLock::new(HookMaps {
                     generation: 7,
-                    bindings: BTreeMap::new(),
+                    bindings: BTreeMap::from([(button, native)]),
                     gestures: BTreeMap::from([(
                         button,
                         GestureMode::Pan(PanBinding {
@@ -923,6 +963,7 @@ mod tests {
                 monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
                 pan_emitter: PanEmitter::new(),
                 gesture_coordinator: GestureCoordinator::default(),
+                coordinate_with_hid: true,
             };
             let _ = HOLD.with_borrow_mut(HoldState::cancel);
             assert_eq!(
@@ -938,10 +979,79 @@ mod tests {
             );
             assert_eq!(
                 handle_button(&context, button, false),
-                EventDisposition::PassThrough,
-                "release after stale motion must not click"
+                EventDisposition::Suppress,
+                "the matching stale release must not leak through its native fallback"
             );
             assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
+
+            let Ok(mut maps) = context.hooks.write() else {
+                panic!("hook maps");
+            };
+            maps.gestures.remove(&button);
+            drop(maps);
+            assert_eq!(
+                handle_button(&context, button, true),
+                EventDisposition::PassThrough,
+                "a fresh native press after the tombstone is consumed must pass through"
+            );
+            assert_eq!(
+                handle_button(&context, button, false),
+                EventDisposition::PassThrough
+            );
+            assert_eq!(actions.try_recv(), Err(mpsc::TryRecvError::Empty));
+        }
+    }
+
+    #[test]
+    fn two_callback_devices_keep_independent_os_gesture_tokens() {
+        let (queue, _actions) = sync_channel(2);
+        let context = Arc::new(HookContext {
+            hooks: Arc::new(RwLock::new(HookMaps {
+                generation: 1,
+                bindings: BTreeMap::new(),
+                gestures: [ButtonId::Back, ButtonId::Forward]
+                    .into_iter()
+                    .map(|button| {
+                        (
+                            button,
+                            GestureMode::Pan(PanBinding {
+                                click: Action::SmartZoom,
+                            }),
+                        )
+                    })
+                    .collect(),
+            })),
+            action_emitter: ActionEmitter { queue },
+            monitor: Arc::new(crate::event_monitor::EventMonitor::default()),
+            pan_emitter: PanEmitter::new(),
+            gesture_coordinator: GestureCoordinator::default(),
+            coordinate_with_hid: false,
+        });
+        let barrier = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [ButtonId::Back, ButtonId::Forward]
+            .into_iter()
+            .map(|button| {
+                let context = Arc::clone(&context);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    assert_eq!(
+                        handle_button(&context, button, true),
+                        EventDisposition::Suppress
+                    );
+                    barrier.wait();
+                    let motion = handle_motion(&context, PAN_DEADZONE, -7);
+                    let release = handle_button(&context, button, false);
+                    (motion, release)
+                })
+            })
+            .collect();
+
+        for worker in workers {
+            let (motion, release) = worker
+                .join()
+                .unwrap_or_else(|_| panic!("callback panicked"));
+            assert_eq!(motion, pan_motion_disposition());
+            assert_eq!(release, EventDisposition::Suppress);
         }
     }
 
