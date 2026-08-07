@@ -211,12 +211,15 @@ fn deserialize_legacy_gesture_owner<'de, D>(
 where
     D: serde::Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
+    let value = toml::Value::deserialize(deserializer)?;
+    let Some(value) = value.as_str() else {
+        return Ok(None);
+    };
     if value == "Off" {
         return Ok(Some(LegacyGestureOwner::Off));
     }
     let button = ButtonId::deserialize(
-        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(&value),
+        serde::de::value::StrDeserializer::<serde::de::value::Error>::new(value),
     )
     .ok();
     Ok(button.map(LegacyGestureOwner::Button))
@@ -227,22 +230,32 @@ impl DeviceConfig {
     /// that were dormant in that schema.
     pub(super) fn normalize_legacy_gesture_owner(&mut self) {
         let owner = self.legacy_gesture_owner.take();
-        for (button, binding) in &mut self.bindings {
-            let active = matches!(
-                owner,
-                Some(LegacyGestureOwner::Button(owner_button)) if owner_button == *button
-            );
-            if (binding.is_gesture() || binding.is_pan()) && !active {
-                let click = match binding {
-                    Binding::Gesture(map) => map
-                        .get(&GestureDirection::Click)
-                        .cloned()
-                        .unwrap_or_else(|| default_binding(*button)),
-                    Binding::Pan(pan) => pan.click.clone(),
-                    Binding::Single(_) => continue,
-                };
-                *binding = Binding::Single(click);
-            }
+        normalize_legacy_bindings(&mut self.bindings, owner);
+        for overlay in self.per_app_bindings.values_mut() {
+            normalize_legacy_bindings(overlay, owner);
+        }
+    }
+}
+
+fn normalize_legacy_bindings(
+    bindings: &mut BTreeMap<ButtonId, Binding>,
+    owner: Option<LegacyGestureOwner>,
+) {
+    for (button, binding) in bindings {
+        let active = matches!(
+            owner,
+            Some(LegacyGestureOwner::Button(owner_button)) if owner_button == *button
+        );
+        if (binding.is_gesture() || binding.is_pan()) && !active {
+            let click = match binding {
+                Binding::Gesture(map) => map
+                    .get(&GestureDirection::Click)
+                    .cloned()
+                    .unwrap_or_else(|| default_binding(*button)),
+                Binding::Pan(pan) => pan.click.clone(),
+                Binding::Single(_) => continue,
+            };
+            *binding = Binding::Single(click);
         }
     }
 }

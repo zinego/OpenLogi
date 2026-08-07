@@ -1386,4 +1386,126 @@ Right = "NextDesktop"
             Some(Binding::Gesture(_))
         ));
     }
+
+    #[test]
+    fn gesture_owner_schema_v3_normalizes_every_per_app_overlay() {
+        let legacy = r#"
+schema_version = 3
+
+[devices.mouse]
+gesture_owner = "Forward"
+
+[devices.mouse.per_app_bindings."com.example.editor".Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.per_app_bindings."com.example.editor".Back]
+Click = "BrowserBack"
+Up = "MissionControl"
+
+[devices.mouse.per_app_bindings."com.example.browser".Back.Pan]
+click = "Copy"
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, legacy).expect("write legacy config");
+
+        let cfg = Config::load_from_path(&path).expect("load schema v3");
+        let editor = cfg
+            .devices
+            .get("mouse")
+            .and_then(|device| device.per_app_bindings.get("com.example.editor"))
+            .expect("editor overlay");
+        assert!(matches!(
+            editor.get(&ButtonId::Forward),
+            Some(Binding::Pan(_))
+        ));
+        assert_eq!(
+            editor.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
+        );
+        let browser = cfg
+            .devices
+            .get("mouse")
+            .and_then(|device| device.per_app_bindings.get("com.example.browser"))
+            .expect("browser overlay");
+        assert_eq!(
+            browser.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::Copy))
+        );
+    }
+
+    #[test]
+    fn gesture_owner_schema_v3_non_button_owner_demotes_per_app_typed_bindings() {
+        for owner_line in ["gesture_owner = \"Off\"", "gesture_owner = 7", ""] {
+            let legacy = format!(
+                r#"
+schema_version = 3
+
+[devices.mouse]
+{owner_line}
+
+[devices.mouse.per_app_bindings."com.example.editor".Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.per_app_bindings."com.example.editor".Back]
+Up = "MissionControl"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, legacy).expect("write legacy config");
+
+            let cfg = Config::load_from_path(&path)
+                .expect("off, invalid, or missing owner must remain lenient");
+            let overlay = cfg
+                .devices
+                .get("mouse")
+                .and_then(|device| device.per_app_bindings.get("com.example.editor"))
+                .expect("editor overlay");
+            assert_eq!(
+                overlay.get(&ButtonId::Forward),
+                Some(&Binding::Single(Action::SmartZoom))
+            );
+            assert_eq!(
+                overlay.get(&ButtonId::Back),
+                Some(&Binding::Single(default_binding(ButtonId::Back)))
+            );
+        }
+    }
+
+    #[test]
+    fn gesture_owner_schema_v4_ignores_malformed_obsolete_value() {
+        for owner_value in ["7", "[\"Forward\"]", "{ selected = \"Forward\" }"] {
+            let current = format!(
+                r#"
+schema_version = 4
+
+[devices.mouse]
+gesture_owner = {owner_value}
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.bindings.Back]
+Click = "MissionControl"
+Up = "MissionControl"
+"#
+            );
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join("config.toml");
+            fs::write(&path, current).expect("write schema v4 config");
+
+            let cfg = Config::load_from_path(&path)
+                .expect("schema v4 must ignore malformed obsolete gesture_owner");
+            let bindings = cfg.bindings_for("mouse");
+            assert!(matches!(
+                bindings.get(&ButtonId::Forward),
+                Some(Binding::Pan(_))
+            ));
+            assert!(matches!(
+                bindings.get(&ButtonId::Back),
+                Some(Binding::Gesture(_))
+            ));
+        }
+    }
 }
