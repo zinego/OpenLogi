@@ -221,28 +221,102 @@ fn selection_requires_request_diversion_and_raw_xy_capability() {
 
 #[tokio::test]
 async fn gesture_reporting_rolls_back_prior_cids_when_a_later_enable_fails() {
+    let back = CaptureControl::Reprog {
+        cid: reprog_controls::BACK_BUTTON_CID,
+        raw_xy: true,
+    };
+    let forward = CaptureControl::Reprog {
+        cid: reprog_controls::FORWARD_BUTTON_CID,
+        raw_xy: true,
+    };
     let calls = RefCell::new(Vec::new());
     let outcome = RefCell::new([Ok(()), Err("forward enable failed"), Ok(())].into_iter());
 
-    let result = set_gesture_reporting_transactionally(
-        [
-            reprog_controls::BACK_BUTTON_CID,
-            reprog_controls::FORWARD_BUTTON_CID,
-        ],
-        |cid, diverted, raw_xy| {
-            calls.borrow_mut().push((cid, diverted, raw_xy));
-            std::future::ready(outcome.borrow_mut().next().unwrap_or(Ok(())))
-        },
-    )
+    let result = set_capture_reporting_transactionally([back, forward], |control, enabled| {
+        calls.borrow_mut().push((control, enabled));
+        std::future::ready(outcome.borrow_mut().next().unwrap_or(Ok(())))
+    })
     .await;
 
     assert_eq!(result, Err("forward enable failed"));
     assert_eq!(
         calls.into_inner(),
         [
-            (reprog_controls::BACK_BUTTON_CID, true, true),
-            (reprog_controls::FORWARD_BUTTON_CID, true, true),
-            (reprog_controls::BACK_BUTTON_CID, false, false),
+            (back, true),
+            (forward, true),
+            (forward, false),
+            (back, false),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn dpi_enable_failure_restores_itself_and_an_armed_gesture() {
+    let gesture = CaptureControl::Reprog {
+        cid: reprog_controls::BACK_BUTTON_CID,
+        raw_xy: true,
+    };
+    let dpi = CaptureControl::Reprog {
+        cid: reprog_controls::DPI_MODE_SHIFT_CIDS[0],
+        raw_xy: false,
+    };
+    let calls = RefCell::new(Vec::new());
+    let outcome = RefCell::new([Ok(()), Err("dpi enable failed"), Ok(()), Ok(())].into_iter());
+
+    let result = set_capture_reporting_transactionally([gesture, dpi], |control, enabled| {
+        calls.borrow_mut().push((control, enabled));
+        std::future::ready(outcome.borrow_mut().next().unwrap_or(Ok(())))
+    })
+    .await;
+
+    assert_eq!(result, Err("dpi enable failed"));
+    assert_eq!(
+        calls.into_inner(),
+        [(gesture, true), (dpi, true), (dpi, false), (gesture, false)]
+    );
+}
+
+#[tokio::test]
+async fn thumbwheel_enable_failure_restores_itself_dpi_and_gesture() {
+    let gesture = CaptureControl::Reprog {
+        cid: reprog_controls::FORWARD_BUTTON_CID,
+        raw_xy: true,
+    };
+    let dpi = CaptureControl::Reprog {
+        cid: reprog_controls::DPI_MODE_SHIFT_CIDS[0],
+        raw_xy: false,
+    };
+    let thumbwheel = CaptureControl::Thumbwheel;
+    let calls = RefCell::new(Vec::new());
+    let outcome = RefCell::new(
+        [
+            Ok(()),
+            Ok(()),
+            Err("thumbwheel enable failed"),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+        ]
+        .into_iter(),
+    );
+
+    let result =
+        set_capture_reporting_transactionally([gesture, dpi, thumbwheel], |control, enabled| {
+            calls.borrow_mut().push((control, enabled));
+            std::future::ready(outcome.borrow_mut().next().unwrap_or(Ok(())))
+        })
+        .await;
+
+    assert_eq!(result, Err("thumbwheel enable failed"));
+    assert_eq!(
+        calls.into_inner(),
+        [
+            (gesture, true),
+            (dpi, true),
+            (thumbwheel, true),
+            (thumbwheel, false),
+            (dpi, false),
+            (gesture, false),
         ]
     );
 }

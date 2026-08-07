@@ -216,24 +216,50 @@ struct ArmedControls {
     /// `0x2150` accessor + feature index, present when the thumb wheel is
     /// diverted.
     thumb: Option<(Thumbwheel, u8)>,
+    /// Every control enabled by the transaction, in enable order.
+    capture_controls: Vec<CaptureControl>,
 }
 
 impl ArmedControls {
     /// Restore every diverted control. Failures are logged, not propagated.
     async fn disarm(&self) {
-        if let Some((rc, _)) = self.reprog.as_ref() {
-            for &cid in self.gesture_controls.keys() {
-                restore(
-                    rc.set_cid_reporting(cid, false, false).await,
-                    "gesture button",
-                );
-            }
-            for &cid in &self.dpi_cids {
-                restore(rc.set_cid_reporting(cid, false, false).await, "DPI button");
-            }
+        for &control in self.capture_controls.iter().rev() {
+            restore(self.set_reporting(control, false).await, control.label());
         }
-        if let Some((tw, _)) = self.thumb.as_ref() {
-            restore(tw.set_reporting(false, false).await, "thumb wheel");
+    }
+
+    /// Apply one reporting state through the accessor for its feature.
+    async fn set_reporting(
+        &self,
+        control: CaptureControl,
+        enabled: bool,
+    ) -> Result<(), GestureError> {
+        set_reporting_on(
+            self.reprog.as_ref().map(|(rc, _)| rc),
+            self.thumb.as_ref().map(|(tw, _)| tw),
+            control,
+            enabled,
+        )
+        .await
+    }
+}
+
+/// One reporting control participating in the all-or-nothing arm transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureControl {
+    /// A `0x1b04` reprogrammable control and whether it needs raw XY.
+    Reprog { cid: u16, raw_xy: bool },
+    /// The `0x2150` thumb-wheel event stream.
+    Thumbwheel,
+}
+
+impl CaptureControl {
+    /// Diagnostic label used when a best-effort restore fails.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Reprog { raw_xy: true, .. } => "gesture button",
+            Self::Reprog { raw_xy: false, .. } => "DPI button",
+            Self::Thumbwheel => "thumb wheel",
         }
     }
 }
@@ -265,21 +291,8 @@ async fn arm_controls(
         let controls = enumerate_controls(&rc).await?;
 
         gesture_controls = select_gesture_controls(&request.gesture_buttons, &controls);
-        let reporting = rc.clone();
-        set_gesture_reporting_transactionally(
-            gesture_controls.keys().copied(),
-            move |cid, diverted, raw_xy| {
-                let reporting = reporting.clone();
-                async move { reporting.set_cid_reporting(cid, diverted, raw_xy).await }
-            },
-        )
-        .await
-        .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
         for &cid in &reprog_controls::DPI_MODE_SHIFT_CIDS {
             if controls.iter().any(|c| c.cid == cid && c.is_divertable()) {
-                rc.set_cid_reporting(cid, true, false)
-                    .await
-                    .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
                 dpi_cids.push(cid);
             }
         }
@@ -312,11 +325,41 @@ async fn arm_controls(
         if !supports_single_tap {
             debug!("thumb wheel reports no single tap — click not capturable");
         }
-        tw.set_reporting(true, false)
-            .await
-            .map_err(|e| GestureError::Hidpp(format!("{e:?}")))?;
         thumb = Some((tw, info.index));
     }
+
+    let capture_controls = gesture_controls
+        .keys()
+        .copied()
+        .map(|cid| CaptureControl::Reprog { cid, raw_xy: true })
+        .chain(
+            dpi_cids
+                .iter()
+                .copied()
+                .map(|cid| CaptureControl::Reprog { cid, raw_xy: false }),
+        )
+        .chain(thumb.is_some().then_some(CaptureControl::Thumbwheel))
+        .collect::<Vec<_>>();
+
+    let reprog_reporting = reprog.as_ref().map(|(rc, _)| rc.clone());
+    let thumb_reporting = thumb.as_ref().map(|(tw, _)| tw.clone());
+    set_capture_reporting_transactionally(
+        capture_controls.iter().copied(),
+        move |control, enabled| {
+            let reprog_reporting = reprog_reporting.clone();
+            let thumb_reporting = thumb_reporting.clone();
+            async move {
+                set_reporting_on(
+                    reprog_reporting.as_ref(),
+                    thumb_reporting.as_ref(),
+                    control,
+                    enabled,
+                )
+                .await
+            }
+        },
+    )
+    .await?;
 
     if gesture_controls.is_empty() && dpi_cids.is_empty() && thumb.is_none() {
         debug!(slot, "no capturable controls — idle session");
@@ -326,7 +369,41 @@ async fn arm_controls(
         gesture_controls,
         dpi_cids,
         thumb,
+        capture_controls,
     })
+}
+
+/// Apply one reporting state using the appropriate HID++ feature accessor.
+async fn set_reporting_on(
+    reprog: Option<&ReprogControlsV4>,
+    thumb: Option<&Thumbwheel>,
+    control: CaptureControl,
+    enabled: bool,
+) -> Result<(), GestureError> {
+    match control {
+        CaptureControl::Reprog { cid, raw_xy } => {
+            let Some(reprog) = reprog else {
+                return Err(GestureError::Hidpp(
+                    "missing reprogrammable-controls accessor".to_owned(),
+                ));
+            };
+            reprog
+                .set_cid_reporting(cid, enabled, enabled && raw_xy)
+                .await
+                .map_err(|e| GestureError::Hidpp(format!("{e:?}")))
+        }
+        CaptureControl::Thumbwheel => {
+            let Some(thumb) = thumb else {
+                return Err(GestureError::Hidpp(
+                    "missing thumb-wheel accessor".to_owned(),
+                ));
+            };
+            thumb
+                .set_reporting(enabled, false)
+                .await
+                .map_err(|e| GestureError::Hidpp(format!("{e:?}")))
+        }
+    }
 }
 
 /// Log (don't propagate) a failure to hand a control back to the firmware.
@@ -372,26 +449,31 @@ fn select_gesture_controls(
         .collect()
 }
 
-/// Enable raw-XY reporting as one best-effort transaction. If enabling a later
-/// CID fails, every earlier CID is restored before the original error returns.
-async fn set_gesture_reporting_transactionally<E, I, Set, SetFuture>(
-    cids: I,
+/// Enable all requested reporting as one best-effort transaction. A failed
+/// enable is disabled too because firmware may have applied the request even
+/// when the response was lost; then every confirmed prior enable is restored
+/// in reverse order before the original error returns.
+async fn set_capture_reporting_transactionally<E, I, Set, SetFuture>(
+    controls: I,
     mut set: Set,
 ) -> Result<(), E>
 where
-    I: IntoIterator<Item = u16>,
-    Set: FnMut(u16, bool, bool) -> SetFuture,
+    I: IntoIterator<Item = CaptureControl>,
+    Set: FnMut(CaptureControl, bool) -> SetFuture,
     SetFuture: Future<Output = Result<(), E>>,
 {
     let mut armed = Vec::new();
-    for cid in cids {
-        if let Err(error) = set(cid, true, true).await {
+    for control in controls {
+        if let Err(error) = set(control, true).await {
+            // The device can apply a reporting change even when its response
+            // is lost, so restore the failed control as well as confirmed ones.
+            let _ = set(control, false).await;
             for prior in armed.into_iter().rev() {
-                let _ = set(prior, false, false).await;
+                let _ = set(prior, false).await;
             }
             return Err(error);
         }
-        armed.push(cid);
+        armed.push(control);
     }
     Ok(())
 }
