@@ -33,8 +33,9 @@ use crate::paths::{self, PathsError};
 /// changes; readers branch on the parsed value before consuming the rest of
 /// the file.
 ///
-/// v4 removes the device-wide gesture owner. Schema-v3 owner state is consumed
-/// once on load so only the previously active typed binding remains typed.
+/// v4 removes the device-wide gesture owner. Schema-v2/v3 owner state is
+/// consumed once on load so only the previously active typed binding remains
+/// typed.
 ///
 /// v3 changes the device map from model keys to physical-device keys. No v2
 /// device entries are migrated because model-scoped settings cannot be assigned
@@ -165,7 +166,7 @@ impl Config {
                         found: config.schema_version,
                     });
                 }
-                if config.schema_version == 3 {
+                if matches!(config.schema_version, 2 | 3) {
                     for device in config.devices.values_mut() {
                         device.normalize_legacy_gesture_owner();
                     }
@@ -1249,6 +1250,64 @@ Right = "NextDesktop"
 
         cfg.save_to_path(&path).expect("save schema v4");
         let saved = fs::read_to_string(path).expect("read saved config");
+        assert!(!saved.contains("gesture_owner"), "got: {saved}");
+    }
+
+    #[test]
+    fn gesture_owner_schema_v2_normalizes_global_and_per_app_bindings() {
+        let legacy = r#"
+schema_version = 2
+
+[devices.mouse]
+gesture_owner = "Forward"
+
+[devices.mouse.bindings.Forward.Pan]
+click = "SmartZoom"
+
+[devices.mouse.bindings.Back]
+Click = "BrowserBack"
+Up = "MissionControl"
+
+[devices.mouse.per_app_bindings."com.example.editor".Forward]
+Click = "Copy"
+Left = "PreviousDesktop"
+
+[devices.mouse.per_app_bindings."com.example.editor".Back.Pan]
+click = "Paste"
+"#;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, legacy).expect("write legacy config");
+
+        let cfg = Config::load_from_path(&path).expect("load schema v2");
+        assert_eq!(cfg.schema_version, 4);
+        let bindings = cfg.bindings_for("mouse");
+        assert!(matches!(
+            bindings.get(&ButtonId::Forward),
+            Some(Binding::Pan(_))
+        ));
+        assert_eq!(
+            bindings.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::BrowserBack))
+        );
+
+        let overlay = cfg
+            .devices
+            .get("mouse")
+            .and_then(|device| device.per_app_bindings.get("com.example.editor"))
+            .expect("editor overlay");
+        assert!(matches!(
+            overlay.get(&ButtonId::Forward),
+            Some(Binding::Gesture(_))
+        ));
+        assert_eq!(
+            overlay.get(&ButtonId::Back),
+            Some(&Binding::Single(Action::Paste))
+        );
+
+        cfg.save_to_path(&path).expect("save schema v4");
+        let saved = fs::read_to_string(path).expect("read saved config");
+        assert!(saved.contains("schema_version = 4"), "got: {saved}");
         assert!(!saved.contains("gesture_owner"), "got: {saved}");
     }
 

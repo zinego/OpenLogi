@@ -13,10 +13,10 @@ DPI / SmartShift / lighting panels), but the file stays hand-editable;
 per-application overlays and custom shortcuts are currently authored there.
 OpenLogi reloads it on startup. Older `schema_version = 1` files (separate
 `button_bindings` / `gesture_bindings` tables) are migrated to the unified
-`bindings` map on first load. Schema 3's device-wide `gesture_owner` is also
-consumed on load: its active typed binding is retained and dormant gesture/Pan
-maps in both global and per-application bindings are reduced to their click
-action (or the button's native default).
+`bindings` map on first load. Schemas 2 and 3's device-wide `gesture_owner` is
+also consumed on load: its active typed binding is retained and dormant
+gesture/Pan maps in both global and per-application bindings are reduced to
+their click action (or the button's native default).
 
 Per-device settings are keyed by the HID++ identifier (e.g. `2b042` for an
 MX Master 4):

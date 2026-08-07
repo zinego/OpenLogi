@@ -52,7 +52,7 @@ pub struct DeviceIdentity {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(from = "RawDeviceConfig")]
 pub struct DeviceConfig {
-    /// Raw obsolete owner value retained only until the schema-v3 migration
+    /// Raw obsolete owner value retained only until the schema-v2/v3 migration
     /// consumes it. It is never serialized or decoded by the live schema.
     #[serde(skip)]
     raw_legacy_gesture_owner: Option<toml::Value>,
@@ -119,10 +119,11 @@ fn is_false(b: &bool) -> bool {
 }
 
 /// Deserialize-only shim that folds pre-v2 binding fields and temporarily
-/// captures schema-v3 owner state. Never serialized (only [`DeviceConfig`] is).
+/// captures schema-v2/v3 owner state. Never serialized (only [`DeviceConfig`]
+/// is).
 #[derive(Deserialize)]
 struct RawDeviceConfig {
-    /// Obsolete owner captured without interpretation. Only the schema-v3
+    /// Obsolete owner captured without interpretation. Only the schema-v2/v3
     /// migration path decodes a valid string value.
     #[serde(default)]
     gesture_owner: Option<toml::Value>,
@@ -218,8 +219,8 @@ fn decode_legacy_gesture_owner(value: Option<&toml::Value>) -> Option<LegacyGest
 }
 
 impl DeviceConfig {
-    /// Consume schema-v3's single-owner state without activating gesture maps
-    /// that were dormant in that schema.
+    /// Consume schema-v2/v3's single-owner state without activating gesture
+    /// maps that were dormant in those schemas.
     pub(super) fn normalize_legacy_gesture_owner(&mut self) {
         let owner = decode_legacy_gesture_owner(self.raw_legacy_gesture_owner.as_ref());
         self.raw_legacy_gesture_owner = None;
