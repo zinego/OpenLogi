@@ -16,6 +16,7 @@ use core_graphics::event::{
     CGEvent, CGEventField, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType, CallbackResult, EventField,
 };
+use core_graphics::geometry::CGPoint;
 use foreign_types_shared::ForeignType as _;
 use tracing::{debug, error, warn};
 
@@ -61,6 +62,7 @@ type IOHIDEventRef = *mut std::ffi::c_void;
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventCopyIOHIDEvent(event: *const std::ffi::c_void) -> IOHIDEventRef;
+    fn CGEventCreateCopy(event: core_graphics::sys::CGEventRef) -> core_graphics::sys::CGEventRef;
 }
 #[link(name = "IOKit", kind = "framework")]
 unsafe extern "C" {
@@ -457,6 +459,101 @@ pub(crate) fn start(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PointerEventKind {
+    ButtonDown,
+    ButtonUp,
+    Motion,
+    Interruption,
+    Other,
+}
+
+fn pointer_event_kind(etype: CGEventType) -> PointerEventKind {
+    match etype {
+        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown => {
+            PointerEventKind::ButtonDown
+        }
+        CGEventType::LeftMouseUp | CGEventType::RightMouseUp | CGEventType::OtherMouseUp => {
+            PointerEventKind::ButtonUp
+        }
+        CGEventType::MouseMoved
+        | CGEventType::LeftMouseDragged
+        | CGEventType::RightMouseDragged
+        | CGEventType::OtherMouseDragged => PointerEventKind::Motion,
+        CGEventType::TapDisabledByTimeout | CGEventType::TapDisabledByUserInput => {
+            PointerEventKind::Interruption
+        }
+        _ => PointerEventKind::Other,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PointerCallbackPlan {
+    Keep,
+    Drop,
+    ReplaceAt([f64; 2]),
+}
+
+#[derive(Default)]
+struct PointerFreezeState {
+    last_stable: Option<[f64; 2]>,
+    anchor: Option<[f64; 2]>,
+}
+
+impl PointerFreezeState {
+    fn plan(
+        &mut self,
+        kind: PointerEventKind,
+        location: [f64; 2],
+        disposition: EventDisposition,
+    ) -> PointerCallbackPlan {
+        if disposition == EventDisposition::FreezePointer {
+            let anchor = *self
+                .anchor
+                .get_or_insert_with(|| self.last_stable.unwrap_or(location));
+            return PointerCallbackPlan::ReplaceAt(anchor);
+        }
+
+        match kind {
+            PointerEventKind::ButtonDown | PointerEventKind::Motion => {
+                self.anchor = None;
+                self.last_stable = Some(location);
+            }
+            PointerEventKind::ButtonUp | PointerEventKind::Interruption => {
+                if let Some(anchor) = self.anchor.take() {
+                    self.last_stable = Some(anchor);
+                } else if kind == PointerEventKind::ButtonUp {
+                    self.last_stable = Some(location);
+                }
+            }
+            PointerEventKind::Other => {}
+        }
+
+        match disposition {
+            EventDisposition::PassThrough => PointerCallbackPlan::Keep,
+            EventDisposition::Suppress => PointerCallbackPlan::Drop,
+            EventDisposition::FreezePointer => unreachable!("handled above"),
+        }
+    }
+}
+
+fn pointer_freeze_replacement(event: &CGEvent, anchor: [f64; 2]) -> Option<CGEvent> {
+    // SAFETY: `event.as_ptr()` is a live CGEventRef. CGEventCreateCopy returns
+    // an independently owned +1 reference or null; `from_ptr` takes ownership
+    // of that reference without retaining the original event.
+    let copied = unsafe { CGEventCreateCopy(event.as_ptr()) };
+    if copied.is_null() {
+        return None;
+    }
+    // SAFETY: the non-null pointer is the +1-owned result of
+    // CGEventCreateCopy and has not been wrapped or released elsewhere.
+    let copied = unsafe { CGEvent::from_ptr(copied) };
+    copied.set_location(CGPoint::new(anchor[0], anchor[1]));
+    copied.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 0);
+    copied.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 0);
+    Some(copied)
+}
+
 /// Body of the background hook thread.
 #[allow(
     clippy::needless_pass_by_value,
@@ -467,6 +564,7 @@ fn thread_main(
     rl_tx: mpsc::Sender<CFRunLoop>,
     stop: Arc<AtomicBool>,
 ) {
+    let pointer_freeze = RefCell::new(PointerFreezeState::default());
     let event_types = vec![
         CGEventType::LeftMouseDown,
         CGEventType::LeftMouseUp,
@@ -494,9 +592,21 @@ fn thread_main(
             let Some(mouse_event) = translate(etype, event) else {
                 return CallbackResult::Keep;
             };
-            match cb(mouse_event) {
-                EventDisposition::PassThrough => CallbackResult::Keep,
-                EventDisposition::Suppress => CallbackResult::Drop,
+            let kind = pointer_event_kind(etype);
+            let location = if kind == PointerEventKind::Interruption {
+                [0.0, 0.0]
+            } else {
+                let location = event.location();
+                [location.x, location.y]
+            };
+            let plan = pointer_freeze
+                .borrow_mut()
+                .plan(kind, location, cb(mouse_event));
+            match plan {
+                PointerCallbackPlan::Keep => CallbackResult::Keep,
+                PointerCallbackPlan::Drop => CallbackResult::Drop,
+                PointerCallbackPlan::ReplaceAt(anchor) => pointer_freeze_replacement(event, anchor)
+                    .map_or(CallbackResult::Drop, CallbackResult::Replace),
             }
         },
     );
@@ -706,5 +816,124 @@ pub(crate) fn stop(inner: HookInner) {
     inner.run_loop.stop();
     if let Err(e) = inner.thread.join() {
         error!("hook thread panicked on shutdown: {e:?}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_graphics::event::CGMouseButton;
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+
+    #[test]
+    fn pointer_freeze_state_anchors_until_release_and_then_tracks_normally() {
+        let mut state = PointerFreezeState::default();
+        assert_eq!(
+            state.plan(
+                PointerEventKind::ButtonDown,
+                [100.0, 200.0],
+                EventDisposition::Suppress,
+            ),
+            PointerCallbackPlan::Drop
+        );
+        assert_eq!(
+            state.plan(
+                PointerEventKind::Motion,
+                [180.0, 260.0],
+                EventDisposition::FreezePointer,
+            ),
+            PointerCallbackPlan::ReplaceAt([100.0, 200.0])
+        );
+        assert_eq!(
+            state.plan(
+                PointerEventKind::Motion,
+                [240.0, 300.0],
+                EventDisposition::FreezePointer,
+            ),
+            PointerCallbackPlan::ReplaceAt([100.0, 200.0])
+        );
+        assert_eq!(
+            state.plan(
+                PointerEventKind::ButtonUp,
+                [240.0, 300.0],
+                EventDisposition::Suppress,
+            ),
+            PointerCallbackPlan::Drop
+        );
+        assert_eq!(state.anchor, None);
+        assert_eq!(state.last_stable, Some([100.0, 200.0]));
+        assert_eq!(
+            state.plan(
+                PointerEventKind::Motion,
+                [105.0, 205.0],
+                EventDisposition::PassThrough,
+            ),
+            PointerCallbackPlan::Keep
+        );
+        assert_eq!(state.last_stable, Some([105.0, 205.0]));
+    }
+
+    #[test]
+    fn tap_interruption_clears_pointer_freeze_anchor() {
+        let mut state = PointerFreezeState::default();
+        let _ = state.plan(
+            PointerEventKind::ButtonDown,
+            [40.0, 50.0],
+            EventDisposition::Suppress,
+        );
+        let _ = state.plan(
+            PointerEventKind::Motion,
+            [80.0, 90.0],
+            EventDisposition::FreezePointer,
+        );
+        assert_eq!(
+            state.plan(
+                PointerEventKind::Interruption,
+                [0.0, 0.0],
+                EventDisposition::PassThrough,
+            ),
+            PointerCallbackPlan::Keep
+        );
+        assert_eq!(state.anchor, None);
+        assert_eq!(state.last_stable, Some([40.0, 50.0]));
+    }
+
+    #[test]
+    fn pointer_freeze_replacement_is_independent_and_zeroes_motion() {
+        let Ok(source) = CGEventSource::new(CGEventSourceStateID::HIDSystemState) else {
+            panic!("CGEventSource");
+        };
+        let Ok(original) = CGEvent::new_mouse_event(
+            source,
+            CGEventType::OtherMouseDragged,
+            CGPoint::new(180.0, 260.0),
+            CGMouseButton::Center,
+        ) else {
+            panic!("CGEvent");
+        };
+        original.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_X, 80);
+        original.set_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y, 60);
+
+        let Some(replacement) = pointer_freeze_replacement(&original, [100.0, 200.0]) else {
+            panic!("CGEventCreateCopy");
+        };
+        assert_ne!(original.as_ptr(), replacement.as_ptr());
+        assert!((original.location().x - 180.0).abs() < f64::EPSILON);
+        assert!((original.location().y - 260.0).abs() < f64::EPSILON);
+        assert_eq!(
+            original.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X),
+            80
+        );
+        assert!((replacement.location().x - 100.0).abs() < f64::EPSILON);
+        assert!((replacement.location().y - 200.0).abs() < f64::EPSILON);
+        assert_eq!(
+            replacement.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_X),
+            0
+        );
+        assert_eq!(
+            replacement.get_integer_value_field(EventField::MOUSE_EVENT_DELTA_Y),
+            0
+        );
     }
 }

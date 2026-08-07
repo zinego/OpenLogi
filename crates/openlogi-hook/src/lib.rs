@@ -76,8 +76,8 @@ pub enum MouseEvent {
         device: Option<EventDevice>,
     },
     /// Pointer movement, in device units. Emitted so a held gesture button can
-    /// accumulate a swipe; the callback passes these through (the cursor keeps
-    /// moving) and only reads them while a gesture button is down.
+    /// accumulate a swipe. Consumers normally pass these through, but a Pan
+    /// binding on macOS may request a frozen-pointer replacement while held.
     Moved {
         /// Positive = right, negative = left.
         delta_x: i32,
@@ -99,6 +99,10 @@ pub enum EventDisposition {
     PassThrough,
     /// Drop the event; the target application never sees it.
     Suppress,
+    /// Replace a macOS pointer-movement event with an independent copy anchored
+    /// at the last stable cursor position and carrying zero movement deltas.
+    #[cfg(target_os = "macos")]
+    FreezePointer,
 }
 
 /// Where in the event stream a tap is inserted (macOS `CGEventTapLocation`).

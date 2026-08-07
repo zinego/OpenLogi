@@ -51,6 +51,8 @@ fn event_disposition_equality() {
     assert_eq!(EventDisposition::PassThrough, EventDisposition::PassThrough);
     assert_eq!(EventDisposition::Suppress, EventDisposition::Suppress);
     assert_ne!(EventDisposition::PassThrough, EventDisposition::Suppress);
+    #[cfg(target_os = "macos")]
+    assert_ne!(EventDisposition::FreezePointer, EventDisposition::Suppress);
 }
 
 /// On unsupported targets (not macOS, Linux, or Windows), `Hook::start`

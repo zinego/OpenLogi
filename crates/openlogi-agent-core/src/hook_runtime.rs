@@ -476,13 +476,23 @@ fn handle_motion(context: &HookContext, delta_x: i32, delta_y: i32) -> EventDisp
         }
         HoldOutput::PanDelta { x, y } => {
             context.pan_emitter.emit(x, y);
-            EventDisposition::Suppress
+            pan_motion_disposition()
         }
         HoldOutput::Suppress if matches!(current, Some(GestureMode::Pan(_))) => {
-            EventDisposition::Suppress
+            pan_motion_disposition()
         }
         HoldOutput::Suppress => EventDisposition::PassThrough,
     }
+}
+
+#[cfg(target_os = "macos")]
+fn pan_motion_disposition() -> EventDisposition {
+    EventDisposition::FreezePointer
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pan_motion_disposition() -> EventDisposition {
+    EventDisposition::Suppress
 }
 
 /// Whether `action` is just `id`'s own native event — i.e. the button is mapped
@@ -819,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn os_hook_pan_suppresses_press_and_motion_until_interrupted() {
+    fn os_hook_pan_freezes_motion_until_interrupted() {
         let context = pan_hook_context();
 
         assert_eq!(
@@ -840,7 +850,7 @@ mod tests {
                     delta_y: -1,
                 },
             ),
-            EventDisposition::Suppress
+            EventDisposition::FreezePointer
         );
         assert_eq!(
             handle_event(&context, &MouseEvent::CaptureInterrupted),
