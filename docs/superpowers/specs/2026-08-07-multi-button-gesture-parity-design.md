@@ -71,10 +71,13 @@ The OS-hook projection remains available for Middle, Back, and Forward as a comp
 the normal path for an ordinary `Single` binding and may interpret a typed gesture only when the
 device does not expose a usable raw-XY control and macOS supplies an observable down-motion-up chain.
 Middle Click commonly follows this path when configured as `Single(MissionControl)`. A control that
-lacks raw XY and reports only a delayed down/up pair cannot provide Pan or directional parity; OpenLogi
-must leave it native or report that the gesture is unavailable rather than infer a hold from unrelated
-pointer motion. The dedicated HID++ gesture button continues through the same keyed HID session when
-its live control advertises the required capabilities.
+lacks raw XY and reports only a delayed down/up pair cannot provide Pan or directional parity. The
+current OS projection cannot detect that delayed-only shape before interpreting the pair, so it may
+treat release as a deadzone click. This is a known fallback limitation, not native-behavior or
+availability-reporting support. Acceptance covers only controls whose HID raw-XY path is active or
+whose event tap supplies a complete lifecycle; capability-aware OS projection and unavailable-state UI
+remain outside this change. The dedicated HID++ gesture button continues through the same keyed HID
+session when its live control advertises the required capabilities.
 
 A Pan hold starts at the keyed press. Each physical raw-XY report contributes one two-axis pixel-scroll
 delta. HID diversion is expected to prevent ordinary cursor travel; the macOS copied-event freeze path
@@ -136,19 +139,28 @@ and confirmed by the live `0x1b04` table. An unsupported or unrequested control 
 control. The GUI reports authorization state and must not describe a preset as runtime-verified.
 
 Capture setup is one transaction across gesture CIDs, DPI controls, and the thumb wheel. Capability
-discovery completes before any mutation. If any enable fails, OpenLogi first disables the failed control
-itself because the device may have applied a request whose response was lost, then disables every
-previously enabled control in reverse order. Normal shutdown, device removal, pairing takeover,
-configuration reload, per-app switch, and Agent restart cancel the active hold and restore the same
-control list in reverse order. A cancelled hold never emits Smart Zoom or a directional click.
+discovery completes before any mutation. If any enable fails, OpenLogi first attempts to disable the
+failed control itself because the device may have applied a request whose response was lost, then
+attempts to disable every previously enabled control in reverse order. A reachable session stopped for
+pairing takeover, configuration reload, or a per-app switch follows the same best-effort reverse
+restore path; restore errors are warnings because transport loss can make the device unreachable. The
+session cancels its active hold before restoration, so a cancelled hold never emits Smart Zoom or a
+directional click.
+
+Device removal and process termination cannot rely on that async teardown completing. HID++ temporary
+diversion is expected to clear when the transport or device resets, but this behavior is an external
+firmware boundary rather than a code-level guarantee. Acceptance must verify native-control readback
+after a reachable teardown and must physically verify recovery after Agent restart and device
+disconnect/reconnect. If either recovery fails, the build does not pass even when unit rollback tests do.
 
 If HID capture shows no Forward press/raw-XY/release chain, the implementation must not compensate with
 guessed CGEvent button numbers or synthetic input. Inspect the live `0x1b04` table, the exact
 `setCidReporting` responses, receiver ownership, and competing Logitech software. If a requested
-control lacks `DIVERTABLE` or `RAW_XY`, retain native behavior unless the OS hook supplies a complete
-physical lifecycle. If the HID report becomes ambiguous because two controls are held, cancel it rather
-than attributing motion by timing. Unsupported non-macOS Pan remains inert and preserves its config for
-later use on macOS.
+control lacks `DIVERTABLE` or `RAW_XY`, typed Gesture/Pan is unsupported unless the OS hook supplies a
+complete physical lifecycle; the present fallback does not expose an unavailable state and can misread
+a delayed-only pair as a click. If the HID report becomes ambiguous because two controls are held,
+cancel it rather than attributing motion by timing. Unsupported non-macOS Pan remains inert and
+preserves its config for later use on macOS.
 
 Installation is recoverable: retain the previous `/Applications/OpenLogi.app` bundle before replacing
 it, and keep the previous config or a copy before any schema migration. Rollback quits the new GUI and
@@ -177,8 +189,9 @@ owner state.
 - Installed ARM64 app verification runs with the PPID-1 bundled agent and stable configuration.
 - Final hardware acceptance uses the real M650: Forward hold+move pans without pointer travel; Forward
   click Smart Zooms; Back performs all five Window Navigation directions; Middle opens Mission Control;
-  ordinary wheel behavior is unchanged. The evidence includes the HID++ lifecycle and proves every
-  diverted CID is restored after reload and shutdown.
+  ordinary wheel behavior is unchanged. The evidence includes the HID++ lifecycle, best-effort restore
+  responses, native-control readback after reload, and physical recovery after Agent restart and device
+  reconnect.
 
 ## Local acceptance procedure and expected results
 
