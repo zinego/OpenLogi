@@ -25,7 +25,7 @@ use crate::event_monitor::SharedEventMonitor;
 use crate::hardware::{toggle_smartshift_in_background, write_dpi_in_background};
 
 /// The two button maps the OS-hook callback reads, kept behind ONE lock so a
-/// config rebuild publishes both atomically — a press during an owner switch can
+/// config rebuild publishes both atomically — a press during a binding change can
 /// never see the new single-action bindings against the old gesture map (or vice
 /// versa), and the common case reads one lock instead of two.
 #[derive(Default)]
@@ -106,6 +106,9 @@ struct HoldState {
 impl HoldState {
     /// Begin a hold for `button`.
     fn begin(&mut self, button: ButtonId, mode: GestureMode, generation: u64) {
+        if self.button.is_some_and(|active| active != button) {
+            let _ = self.cancel();
+        }
         self.button = Some(button);
         self.generation = generation;
         self.gesture = Some(match mode {
@@ -814,6 +817,67 @@ mod tests {
         );
         assert_eq!(hold.cancel(), HoldOutput::Suppress);
         assert_eq!(hold.end(ButtonId::Back), None);
+    }
+
+    #[test]
+    fn overlapping_gesture_holds_keep_only_the_newest_press() {
+        for (first, second) in [
+            (ButtonId::Back, ButtonId::Forward),
+            (ButtonId::Forward, ButtonId::Back),
+        ] {
+            let mut hold = HoldState::default();
+            hold.begin(
+                first,
+                GestureMode::Directional(BTreeMap::from([(
+                    openlogi_core::binding::GestureDirection::Click,
+                    Action::Copy,
+                )])),
+                1,
+            );
+            hold.begin(
+                second,
+                GestureMode::Pan(PanBinding {
+                    click: Action::SmartZoom,
+                }),
+                1,
+            );
+
+            assert_eq!(hold.active_button(), Some(second));
+            assert_eq!(
+                hold.accumulate(PAN_DEADZONE, -7),
+                HoldOutput::PanDelta {
+                    x: PAN_DEADZONE,
+                    y: -7,
+                },
+                "motion belongs to the newest hold"
+            );
+            assert_eq!(hold.end(first), None, "the cancelled hold cannot click");
+            assert_eq!(
+                hold.end(second),
+                Some(HoldOutput::Suppress),
+                "the newest hold owns release"
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_gesture_interruption_and_generation_reset_do_not_click() {
+        let mode = GestureMode::Pan(PanBinding {
+            click: Action::SmartZoom,
+        });
+        let mut hold = HoldState::default();
+        hold.begin(ButtonId::Back, mode.clone(), 7);
+        hold.begin(ButtonId::Forward, mode.clone(), 7);
+        assert_eq!(hold.cancel(), HoldOutput::Suppress);
+        assert_eq!(hold.end(ButtonId::Back), None);
+        assert_eq!(hold.end(ButtonId::Forward), None);
+
+        hold.begin(ButtonId::Back, mode.clone(), 7);
+        hold.begin(ButtonId::Forward, mode.clone(), 7);
+        assert!(!hold.mode_matches(ButtonId::Forward, Some(&mode), 8));
+        assert_eq!(hold.cancel(), HoldOutput::Suppress);
+        assert_eq!(hold.end(ButtonId::Back), None);
+        assert_eq!(hold.end(ButtonId::Forward), None);
     }
 
     #[test]

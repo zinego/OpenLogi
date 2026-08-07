@@ -49,9 +49,8 @@ fn gesture_mode(binding: Binding, fill_directional_defaults: bool) -> Option<Ges
 /// [`default_binding`].
 ///
 /// This is the map the OS hook and the HID++ button-press path consume, so a
-/// `Binding::Gesture` is projected to its `click_action()` — the gesture
-/// button's per-direction swipes are dispatched via the separate
-/// [`hid_gesture_for`] mode, not here.
+/// `Binding::Gesture` is projected to its `click_action()` — hold/motion/release
+/// is dispatched through [`hid_gesture_for`] or [`oshook_gestures_for`].
 #[must_use]
 pub fn bindings_for(
     config: &Config,
@@ -88,27 +87,12 @@ pub fn hid_gesture_for(
     config_key: Option<&str>,
     app_bundle: Option<&str>,
 ) -> Option<GestureMode> {
-    // The dedicated HID++ gesture button (CID 0x00c3) only gestures while it is the device's gesture
-    // owner. When the user moves the role to an OS-hook button (Middle/Back/
-    // Forward) or turns gestures off, return an empty map so the gesture watcher
-    // dispatches nothing — otherwise the always-seeded defaults would keep the
-    // HID++ gesture button firing regardless of the selection.
-    let owner = config_key.and_then(|key| config.gesture_owner(key));
-    if owner != Some(ButtonId::GestureButton) {
-        return None;
-    }
-    let Some(key) = config_key else {
-        return Some(GestureMode::Directional(
-            GestureDirection::ALL
-                .iter()
-                .copied()
-                .map(|direction| (direction, default_gesture_binding(direction)))
-                .collect(),
-        ));
-    };
-    let binding = config
-        .effective_bindings(key, app_bundle)
-        .remove(&ButtonId::GestureButton)
+    let binding = config_key
+        .and_then(|key| {
+            config
+                .effective_bindings(key, app_bundle)
+                .remove(&ButtonId::GestureButton)
+        })
         .unwrap_or_else(|| Binding::Gesture(BTreeMap::new()));
     gesture_mode(binding, true)
 }
@@ -119,19 +103,16 @@ pub fn hid_gesture_for(
 ///
 /// Unlike [`hid_gesture_for`] (the dedicated HID++ gesture button, which
 /// seeds every direction from [`default_gesture_binding`] at projection time),
-/// this returns the owner's raw stored map. In practice that map is already
-/// fully populated — [`Config::set_gesture_owner`] seeds all five directions via
-/// [`Binding::fill_gesture_defaults`] when a button is promoted — so only a
-/// hand-edited sparse map leaves a direction unbound, in which case the OS-hook
-/// runtime uses the map's click action (or the button's native default when Click
-/// is also absent) as its fallback. The dedicated gesture button is intentionally excluded:
+/// this returns each button's raw stored map. A hand-edited sparse map leaves a
+/// direction unbound, in which case the OS-hook runtime uses the map's click
+/// action (or the button's native default when Click is also absent) as its
+/// fallback. The dedicated gesture button is intentionally excluded:
 /// it never reaches the OS hook (it's captured over HID++), so it has no entry
 /// here.
 ///
-/// A per-app override of the owner button turns it into a [`Binding::Single`]
-/// for that app, so it stops being a gesture button there and falls through to
-/// the single-action path (which applies the override) — mirroring how a single
-/// binding is overridden per app.
+/// A per-app [`Binding::Single`] override removes only that button from the
+/// gesture projection, so it falls through to the single-action path while
+/// other gesture buttons remain active.
 #[must_use]
 pub fn oshook_gestures_for(
     config: &Config,
@@ -141,24 +122,12 @@ pub fn oshook_gestures_for(
     let Some(key) = config_key else {
         return BTreeMap::new();
     };
-    // Only an OS-hook button (Middle/Back/Forward) as the device's gesture owner
-    // feeds the OS hook: the dedicated HID++ gesture button is captured over HID++, and a non-owner
-    // button is dispatched as its single click action. Returning *only* the owner
-    // keeps the runtime in lockstep with `gesture_owner` and the GUI, so a stray
-    // second gesture map (e.g. a hand-edited config) can't make two buttons fire.
-    let Some(owner) = config
-        .gesture_owner(key)
-        .filter(|id| id.is_os_hook_button())
-    else {
-        return BTreeMap::new();
-    };
-    // Read the per-app *effective* map: a per-app override replaces the owner with
-    // a `Single`, dropping it from the gesture set for that app.
     config
         .effective_bindings(key, app_bundle)
-        .remove(&owner)
-        .and_then(|binding| gesture_mode(binding, false))
-        .map_or_else(BTreeMap::new, |mode| BTreeMap::from([(owner, mode)]))
+        .into_iter()
+        .filter(|(button, _)| button.is_os_hook_button())
+        .filter_map(|(button, binding)| gesture_mode(binding, false).map(|mode| (button, mode)))
+        .collect()
 }
 
 #[cfg(test)]
@@ -194,14 +163,37 @@ mod tests {
     }
 
     #[test]
-    fn oshook_pan_owner_projects_as_typed_pan_not_an_action() {
+    fn oshook_pan_projects_as_typed_pan_not_an_action() {
         let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
         cfg.set_binding("2b042", ButtonId::Back, default_pan_binding());
 
         let modes = oshook_gestures_for(&cfg, Some("2b042"), None);
         assert!(matches!(
             modes.get(&ButtonId::Back),
+            Some(GestureMode::Pan(_))
+        ));
+    }
+
+    #[test]
+    fn oshook_gestures_collects_back_directional_and_forward_pan() {
+        let mut cfg = Config::default();
+        cfg.set_binding(
+            "2b042",
+            ButtonId::Back,
+            Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Left,
+                Action::PreviousDesktop,
+            )])),
+        );
+        cfg.set_binding("2b042", ButtonId::Forward, default_pan_binding());
+
+        let modes = oshook_gestures_for(&cfg, Some("2b042"), None);
+        assert!(matches!(
+            modes.get(&ButtonId::Back),
+            Some(GestureMode::Directional(_))
+        ));
+        assert!(matches!(
+            modes.get(&ButtonId::Forward),
             Some(GestureMode::Pan(_))
         ));
     }
@@ -272,29 +264,34 @@ mod tests {
     }
 
     #[test]
-    fn per_app_override_drops_the_owner_from_the_oshook_gesture_set() {
-        // Back is the gesture owner globally...
+    fn per_app_single_drops_only_its_oshook_gesture() {
         let mut cfg = Config::default();
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
-        assert!(
-            oshook_gestures_for(&cfg, Some("2b042"), None).contains_key(&ButtonId::Back),
-            "Back gestures globally"
+        cfg.set_binding(
+            "2b042",
+            ButtonId::Back,
+            Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Left,
+                Action::PreviousDesktop,
+            )])),
         );
+        cfg.set_binding("2b042", ButtonId::Forward, default_pan_binding());
 
-        // ...but a per-app override makes it a single action in that app, so it
-        // must drop out of the gesture set there (and fall through to the
-        // single-action path, which applies the override).
         cfg.set_per_app_binding(
             "2b042",
             "com.apple.Safari",
             ButtonId::Back,
             Some(Binding::Single(Action::NextTab)),
         );
+        let safari = oshook_gestures_for(&cfg, Some("2b042"), Some("com.apple.Safari"));
         assert!(
-            oshook_gestures_for(&cfg, Some("2b042"), Some("com.apple.Safari")).is_empty(),
-            "a per-app override of the owner removes it from the gesture set"
+            !safari.contains_key(&ButtonId::Back),
+            "the overridden Back binding becomes an ordinary action"
         );
-        // Other apps are unaffected — Back still gestures.
+        assert!(
+            safari.contains_key(&ButtonId::Forward),
+            "the independent Forward Pan binding remains active"
+        );
+
         assert!(
             oshook_gestures_for(&cfg, Some("2b042"), Some("com.other.App"))
                 .contains_key(&ButtonId::Back)
@@ -302,24 +299,61 @@ mod tests {
     }
 
     #[test]
-    fn gesture_bindings_silent_when_hidpp_button_is_not_the_owner() {
+    fn per_app_typed_binding_promotes_only_its_oshook_button() {
         let mut cfg = Config::default();
-        // Default device: the dedicated HID++ gesture button owns gestures, so its defaults are seeded.
+        cfg.set_binding("2b042", ButtonId::Back, Action::MouseBack.into());
+        cfg.set_binding("2b042", ButtonId::Forward, Action::MouseForward.into());
+        cfg.set_per_app_binding(
+            "2b042",
+            "com.apple.Safari",
+            ButtonId::Forward,
+            Some(default_pan_binding()),
+        );
+
+        let safari = oshook_gestures_for(&cfg, Some("2b042"), Some("com.apple.Safari"));
+        assert_eq!(safari.len(), 1);
+        assert!(matches!(
+            safari.get(&ButtonId::Forward),
+            Some(GestureMode::Pan(_))
+        ));
+        assert!(!safari.contains_key(&ButtonId::Back));
+        assert!(
+            oshook_gestures_for(&cfg, Some("2b042"), Some("com.other.App")).is_empty(),
+            "the typed override does not promote the global binding"
+        );
+    }
+
+    #[test]
+    fn dedicated_hid_gesture_coexists_with_oshook_gestures() {
+        let mut cfg = Config::default();
+        cfg.set_binding(
+            "2b042",
+            ButtonId::Back,
+            Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Left,
+                Action::PreviousDesktop,
+            )])),
+        );
+        cfg.set_binding("2b042", ButtonId::Forward, default_pan_binding());
+        cfg.set_binding(
+            "2b042",
+            ButtonId::GestureButton,
+            Binding::Gesture(BTreeMap::from([(
+                GestureDirection::Up,
+                Action::MissionControl,
+            )])),
+        );
+
         let Some(GestureMode::Directional(defaults)) = hid_gesture_for(&cfg, Some("2b042"), None)
         else {
-            panic!("the default owner should be directional");
+            panic!("the dedicated HID++ button should remain directional");
         };
         assert_eq!(
             defaults.get(&GestureDirection::Up),
-            Some(&default_gesture_binding(GestureDirection::Up))
+            Some(&Action::MissionControl)
         );
-
-        // Move the gesture role to an OS-hook button: the HID++ gesture button goes silent,
-        // so the watcher dispatches nothing for 0x00c3.
-        cfg.set_gesture_owner("2b042", ButtonId::Back);
-        assert!(
-            hid_gesture_for(&cfg, Some("2b042"), None).is_none(),
-            "HID++ gesture button must dispatch nothing once another button owns gestures"
-        );
+        let oshook = oshook_gestures_for(&cfg, Some("2b042"), None);
+        assert!(oshook.contains_key(&ButtonId::Back));
+        assert!(oshook.contains_key(&ButtonId::Forward));
     }
 }

@@ -280,11 +280,9 @@ async fn manage(
                 } else {
                     let target = dpi_cycle.read().ok().and_then(|guard| guard.target.clone());
                     let sensitivity = thumbwheel_sensitivity.load(Ordering::Relaxed);
-                    // Divert the dedicated HID++ gesture button only while it owns the gesture role. The
-                    // shared gesture map is non-empty exactly then (gesture_bindings_for
-                    // gates on the owner), so it doubles as that signal — no need to
-                    // thread the full config in. Re-evaluated each tick, so a
-                    // ReloadConfig owner change restarts the session accordingly.
+                    // Divert the dedicated HID++ gesture button only while its
+                    // effective binding is typed as Gesture or Pan. Re-evaluated
+                    // each tick, so a config reload can re-arm capture.
                     let divert_gesture = gesture_bindings
                         .read()
                         .is_ok_and(|state| state.mode.is_some());

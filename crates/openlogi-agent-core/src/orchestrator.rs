@@ -153,7 +153,7 @@ impl Orchestrator {
     }
 
     /// Build the OS-hook callback's maps for `key` + foreground `app`. Both hook
-    /// sub-maps are app-scoped (a per-app override can demote the gesture owner),
+    /// sub-maps are app-scoped (a per-app override can replace a gesture binding),
     /// so they're built together here and published under one lock — keeping
     /// `rebuild` and `set_current_app` from drifting into a half-populated write.
     fn hook_maps_for(&self, key: Option<&str>, app: Option<&str>) -> HookMaps {
@@ -170,7 +170,7 @@ impl Orchestrator {
         self.shared.capture_epoch.invalidate();
         let key = self.current_key();
         // One write publishes both hook maps atomically, so a button press during
-        // an owner switch can't observe a half-updated state.
+        // a binding change can't observe a half-updated state.
         write_value(
             &self.shared.hook_maps,
             self.hook_maps_for(key, self.current_app.as_deref()),
@@ -351,11 +351,9 @@ impl Orchestrator {
         self.config.app_settings.launch_at_login
     }
 
-    /// Foreground-app change → re-overlay per-app bindings on the hook maps (DPI
-    /// and the dedicated HID++ gesture map are not app-scoped, so they're untouched).
-    /// Both hook maps are recomputed: a per-app override of the gesture owner
-    /// turns it into a single action for that app, dropping it from the OS-hook
-    /// gesture set — so the gesture map is app-scoped too.
+    /// Foreground-app change → re-overlay per-app bindings on the hook maps and
+    /// dedicated HID++ gesture mode. A per-app override can replace one gesture
+    /// binding while leaving other gesture buttons active. DPI remains unchanged.
     pub fn set_current_app(&mut self, bundle: Option<String>) {
         if bundle == self.current_app {
             return;
