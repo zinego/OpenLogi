@@ -1457,7 +1457,7 @@ impl AppState {
 /// or carried-forward `None` — so a placeholder never persists empty panels.
 /// The change-guard keeps quiet inventory ticks off the disk; the agent does
 /// not consume identities, so no `ReloadConfig` is sent.
-fn persist_identities(config: &mut Config, list: &[DeviceRecord]) {
+fn record_identities(config: &mut Config, list: &[DeviceRecord]) -> bool {
     let mut changed = false;
     for record in list {
         if !record.online {
@@ -1485,7 +1485,18 @@ fn persist_identities(config: &mut Config, list: &[DeviceRecord]) {
             changed = true;
         }
     }
-    if changed && let Err(e) = config.save_atomic() {
+    changed
+}
+
+fn persist_identities(config: &mut Config, list: &[DeviceRecord]) {
+    // Unit-test fixtures must never resolve the process-global config path.
+    // They still exercise the in-memory merge through `record_identities`.
+    #[cfg(test)]
+    record_identities(config, list);
+    #[cfg(not(test))]
+    if record_identities(config, list)
+        && let Err(e) = config.save_atomic()
+    {
         warn!(error = %e, "could not persist device identities to config.toml");
     }
 }
@@ -1567,7 +1578,7 @@ mod tests {
     use openlogi_hid::{SmartShiftMode, SmartShiftStatus};
 
     use super::{
-        AppState, Load, SmartShiftWriteStatus, build_device_list,
+        AppState, Load, SmartShiftWriteStatus, build_device_list, record_identities,
         set_scroll_resolution_if_supported, smartshift_read_is_current, smartshift_write_outcome,
     };
 
@@ -1597,6 +1608,22 @@ mod tests {
                 capabilities: Some(Capabilities::presumed_from_kind(DeviceKind::Mouse)),
             }],
         }
+    }
+
+    #[test]
+    fn recording_runtime_identities_is_an_in_memory_change() {
+        let cache = AssetResolver::new();
+        let inventory = direct_inventory([1, 2, 3, 4]);
+        let mut config = Config::default();
+        let list = build_device_list(&[inventory], &cache, &config);
+
+        assert!(record_identities(&mut config, &list));
+        assert!(
+            config
+                .device_identity("direct:046d:b023:unit:01020304")
+                .is_some()
+        );
+        assert!(!record_identities(&mut config, &list));
     }
 
     #[test]
