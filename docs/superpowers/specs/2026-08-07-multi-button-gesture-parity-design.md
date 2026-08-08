@@ -79,10 +79,27 @@ whose event tap supplies a complete lifecycle; capability-aware OS projection an
 remain outside this change. The dedicated HID++ gesture button continues through the same keyed HID
 session when its live control advertises the required capabilities.
 
-A Pan hold starts at the keyed press. Each physical raw-XY report contributes one two-axis pixel-scroll
-delta. HID diversion is expected to prevent ordinary cursor travel; the macOS copied-event freeze path
-remains a guard for OS-hook gesture input and pins replacement motion to the press location with both
-pointer deltas cleared. Release inside the deadzone dispatches the Pan click action once; release after
+A Pan hold starts at the keyed press. Normally every physical raw-XY report contributes one two-axis
+pixel-scroll delta. The Bluetooth-direct M650 acceptance route (`046d:b02a`) has one narrowly scoped
+exception: for Back `0x0053` and Forward `0x0056`, OpenLogi discards the first raw-XY report after each
+new press. A 60-second raw capture split into 17 complete press/release sessions (10 Forward, 7 Back)
+showed that the first report is not a usable delta for the new hold and is consistent with a pre-press
+device accumulator. Click-like sessions began with values as large as Forward `(859,-1898)` and Back `(-70,-76)`,
+while following reports were zero or approximately one unit. Movement sessions likewise began with
+a discontinuity, then carried sustained motion in later reports. This is empirical M650
+behavior, not a HID++ protocol invariant.
+
+The exception is selected from the exact direct-device VID/PID and logical Back/Forward button. It does
+not apply to a dedicated gesture control on the same route, another direct product ID, or Bolt/Unifying
+routes whose device PID is not represented by `DeviceRoute`. Those paths preserve the first raw-XY
+report. The compatibility cost is that the acceptance M650 can lose the small amount of genuine motion
+coalesced into its first post-press report; subsequent reports still provide the continuous gesture.
+This is preferable to turning a click into a hundreds- or thousands-unit Pan, but it must not be
+generalized without equivalent multi-session hardware evidence and a no-stale-device regression test.
+
+HID diversion is expected to prevent ordinary cursor travel; the macOS copied-event freeze path remains
+a guard for OS-hook gesture input and pins replacement motion to the press location with both pointer
+deltas cleared. Release inside the deadzone dispatches the Pan click action once; release after
 continuous movement does not. Window Navigation uses the same keyed lifecycle but commits at most one
 directional action. Physical verification records both HID++ `DivertedButtons`/raw-XY messages and any
 corresponding CGEvent stream; synthetic CGEvent success alone is insufficient evidence.
@@ -162,6 +179,13 @@ a delayed-only pair as a click. If the HID report becomes ambiguous because two 
 cancel it rather than attributing motion by timing. Unsupported non-macOS Pan remains inert and
 preserves its config for later use on macOS.
 
+If a future M650 firmware or transport no longer exhibits the pre-press first report, repeated raw
+captures will show the first report aligned with the following motion instead of a discontinuity. The
+rollback is to remove `046d:b02a` Back/Forward from the first-report discard policy and reinstall the
+prior bundle; do not compensate by increasing the Pan deadzone. If another product exhibits the same
+behavior, add it only after button-specific repeated captures and preserve a regression proving that
+unlisted products and dedicated gesture controls deliver their first report.
+
 Installation is recoverable: retain the previous `/Applications/OpenLogi.app` bundle before replacing
 it, and keep the previous config or a copy before any schema migration. Rollback quits the new GUI and
 Agent, restores the prior bundle and config, and re-enables its Accessibility identity if macOS treats
@@ -181,7 +205,8 @@ owner state.
 - Core migration and round-trip tests cover simultaneous Forward Pan + Back Window Navigation.
 - HID tests discover and arm requested Back/Forward CIDs, preserve signed XY, reject unsupported
   controls, cancel ambiguous two-button holds, and roll back partial setup across gesture, DPI, and
-  thumb-wheel controls.
+  thumb-wheel controls. Device-policy tests discard the first Back/Forward report only for direct
+  `046d:b02a`, while preserving the first report for its dedicated gesture control and other products.
 - Agent-core tests project and dispatch both buttons concurrently, including per-app overlays,
   session-epoch invalidation, keyed stale-release rejection, and overlapping-hold cancellation.
 - GUI pure-state tests prove one card changes without demoting another and labels classify both.
@@ -189,9 +214,11 @@ owner state.
 - Installed ARM64 app verification runs with the PPID-1 bundled agent and stable configuration.
 - Final hardware acceptance uses the real M650: Forward hold+move pans without pointer travel; Forward
   click Smart Zooms; Back performs all five Window Navigation directions; Middle opens Mission Control;
-  ordinary wheel behavior is unchanged. The evidence includes the HID++ lifecycle, best-effort restore
-  responses, native-control readback after reload, and physical recovery after Agent restart and device
-  reconnect.
+  ordinary wheel behavior is unchanged. Repeated Forward click, Forward hold+move, and Back captures
+  must show the complete first-report and subsequent-report timeline so the product-scoped discard does
+  not hide the first meaningful movement. The evidence includes the HID++ lifecycle, best-effort
+  restore responses, native-control readback after reload, and physical recovery after Agent restart
+  and device reconnect.
 
 ## Local acceptance procedure and expected results
 
