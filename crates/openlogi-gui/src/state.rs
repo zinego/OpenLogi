@@ -1754,19 +1754,22 @@ mod tests {
             &AssetResolver::new(),
             commands,
         );
-        let temp = tempfile::tempdir().expect("tempdir");
+        let Ok(temp) = tempfile::tempdir() else {
+            panic!("tempdir");
+        };
         let config_path = temp.path().join("config.toml");
         state.test_config_path = Some(config_path.clone());
-        let key = state
-            .current_record()
-            .expect("M650 record")
-            .config_key
-            .clone();
+        let Some(record) = state.current_record() else {
+            panic!("M650 record");
+        };
+        let key = record.config_key.clone();
 
         state.commit_invert_scroll(true);
 
         assert!(state.current_invert_scroll());
-        let saved = Config::load_from_path(&config_path).expect("saved config");
+        let Ok(saved) = Config::load_from_path(&config_path) else {
+            panic!("saved config");
+        };
         assert!(saved.invert_scroll(&key));
         assert!(matches!(
             receiver.try_recv(),

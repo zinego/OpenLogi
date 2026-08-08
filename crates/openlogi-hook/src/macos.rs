@@ -456,9 +456,8 @@ fn inverted_scroll_event(event: &CGEvent) -> Result<CGEvent, ()> {
 
 fn callback_result(disposition: EventDisposition, event: &CGEvent) -> CallbackResult {
     match disposition {
-        EventDisposition::PassThrough => CallbackResult::Keep,
+        EventDisposition::PassThrough | EventDisposition::FreezePointer => CallbackResult::Keep,
         EventDisposition::Suppress => CallbackResult::Drop,
-        EventDisposition::FreezePointer => CallbackResult::Keep,
         EventDisposition::InvertScroll => {
             if let Ok(replacement) = inverted_scroll_event(event) {
                 CallbackResult::Replace(replacement)
@@ -702,10 +701,11 @@ impl PointerFreezeState {
         }
 
         match disposition {
-            EventDisposition::PassThrough => PointerCallbackPlan::Keep,
+            EventDisposition::PassThrough | EventDisposition::InvertScroll => {
+                PointerCallbackPlan::Keep
+            }
             EventDisposition::Suppress => PointerCallbackPlan::Drop,
             EventDisposition::FreezePointer => unreachable!("handled above"),
-            EventDisposition::InvertScroll => PointerCallbackPlan::Keep,
         }
     }
 }
