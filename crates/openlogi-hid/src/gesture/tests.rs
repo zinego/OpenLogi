@@ -19,12 +19,19 @@ fn diverted(cids: &[u16]) -> RawControlEvent {
     RawControlEvent::DivertedButtons(report)
 }
 
+fn m650_accum() -> CaptureAccum {
+    CaptureAccum::for_route(&DeviceRoute::Direct {
+        vendor_id: 0x046d,
+        product_id: 0xb02a,
+    })
+}
+
 #[test]
 fn back_reports_press_motion_and_release_with_its_identity() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let gestures = gesture_controls(&[ButtonId::Back]);
     let back = reprog_controls::BACK_BUTTON_CID;
-    let mut acc = CaptureAccum::default();
+    let mut acc = m650_accum();
 
     handle_reprog(&mut acc, diverted(&[back]), &gestures, &[], &tx);
     handle_reprog(
@@ -63,7 +70,7 @@ fn forward_reports_press_motion_and_release_with_its_identity() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let gestures = gesture_controls(&[ButtonId::Forward]);
     let forward = reprog_controls::FORWARD_BUTTON_CID;
-    let mut acc = CaptureAccum::default();
+    let mut acc = m650_accum();
 
     handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
     handle_reprog(
@@ -102,7 +109,7 @@ fn first_raw_xy_after_press_is_discarded_as_stale_device_accumulation() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let gestures = gesture_controls(&[ButtonId::Forward]);
     let forward = reprog_controls::FORWARD_BUTTON_CID;
-    let mut acc = CaptureAccum::default();
+    let mut acc = m650_accum();
 
     handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
     handle_reprog(
@@ -129,6 +136,73 @@ fn first_raw_xy_after_press_is_discarded_as_stale_device_accumulation() {
                 button: ButtonId::Forward,
                 delta_x: -1,
                 delta_y: 2,
+            }),
+            Ok(CapturedInput::GestureReleased(ButtonId::Forward)),
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn first_raw_xy_is_preserved_without_a_device_specific_quirk() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::GestureButton]);
+    let gesture = reprog_controls::GESTURE_BUTTON_CID;
+    let mut acc = m650_accum();
+
+    handle_reprog(&mut acc, diverted(&[gesture]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 12, dy: -7 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed(ButtonId::GestureButton)),
+            Ok(CapturedInput::GestureMotion {
+                button: ButtonId::GestureButton,
+                delta_x: 12,
+                delta_y: -7,
+            }),
+            Ok(CapturedInput::GestureReleased(ButtonId::GestureButton)),
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn first_forward_raw_xy_is_preserved_on_other_device_routes() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Forward]);
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let mut acc = CaptureAccum::for_route(&DeviceRoute::Direct {
+        vendor_id: 0x046d,
+        product_id: 0xb025,
+    });
+
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: 12, dy: -7 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
+            Ok(CapturedInput::GestureMotion {
+                button: ButtonId::Forward,
+                delta_x: 12,
+                delta_y: -7,
             }),
             Ok(CapturedInput::GestureReleased(ButtonId::Forward)),
         ]

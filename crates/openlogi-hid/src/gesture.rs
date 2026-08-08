@@ -106,9 +106,28 @@ struct CaptureAccum {
     /// Whether the next raw-XY report belongs to the device's pre-press
     /// accumulator and must not enter the new gesture lifecycle.
     discard_next_raw_xy: bool,
+    /// Controls whose first raw-XY report is a known pre-press accumulator
+    /// snapshot on this exact device route.
+    discard_first_raw_xy_for: BTreeSet<ButtonId>,
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
     dpi_down: bool,
+}
+
+impl CaptureAccum {
+    fn for_route(route: &DeviceRoute) -> Self {
+        let discard_first_raw_xy_for = match route {
+            DeviceRoute::Direct {
+                vendor_id: 0x046d,
+                product_id: 0xb02a,
+            } => [ButtonId::Back, ButtonId::Forward].into_iter().collect(),
+            _ => BTreeSet::new(),
+        };
+        Self {
+            discard_first_raw_xy_for,
+            ..Self::default()
+        }
+    }
 }
 
 /// Capture the requested gesture buttons, DPI/ModeShift button, and optional
@@ -143,7 +162,7 @@ pub async fn run_capture_session(
         *slot = Some(SharedChannel::new(Arc::clone(&chan), route.clone()));
     }
 
-    let accum = Arc::new(Mutex::new(CaptureAccum::default()));
+    let accum = Arc::new(Mutex::new(CaptureAccum::for_route(&route)));
     let reprog_index = armed.reprog.as_ref().map(|(_, idx)| *idx);
     let thumb_index = armed.thumb.as_ref().map(|(_, idx)| *idx);
     let dpi_set = armed.dpi_cids.clone();
@@ -520,7 +539,7 @@ fn handle_reprog(
                 }
                 if let Some(button) = next {
                     acc.active_gesture = Some(button);
-                    acc.discard_next_raw_xy = true;
+                    acc.discard_next_raw_xy = acc.discard_first_raw_xy_for.contains(&button);
                     let _ = sink.send(CapturedInput::GesturePressed(button));
                 }
             }
