@@ -102,6 +102,18 @@ impl SwipeAccumulator {
         self.fired = false;
     }
 
+    /// Begin a fresh hold whose motion may commit immediately.
+    ///
+    /// Use this only for a diverted HID++ RawXY lifecycle: its button press is
+    /// authoritative and device-specific stale reports have already been
+    /// filtered by the HID layer. OS-hook input should continue using
+    /// [`Self::begin`] so ordinary pointer drift cannot turn a quick click into
+    /// a swipe.
+    pub fn begin_immediate(&mut self) {
+        self.begin();
+        self.held_since = Instant::now().checked_sub(GESTURE_HOLD_FOR_SWIPE);
+    }
+
     /// Whether a hold is in progress (between [`Self::begin`] and [`Self::end`]),
     /// so callers can do rising/falling-edge detection without a second flag.
     #[must_use]

@@ -598,7 +598,7 @@ fn advance_gesture(
             gesture.button = Some(button);
             gesture.mode = Some(mode.clone());
             match mode {
-                GestureMode::Directional(_) => gesture.swipe.begin(),
+                GestureMode::Directional(_) => gesture.swipe.begin_immediate(),
                 GestureMode::Pan(_) => gesture.pan.begin(),
             }
             GestureOutput::Idle
@@ -1099,9 +1099,11 @@ mod tests {
     }
 
     #[test]
-    fn gesture_quick_motion_releases_as_click() {
-        let mode =
-            GestureMode::Directional(BTreeMap::from([(GestureDirection::Click, Action::Copy)]));
+    fn hid_raw_xy_commits_a_fast_direction_instead_of_misfiring_click() {
+        let mode = GestureMode::Directional(BTreeMap::from([
+            (GestureDirection::Right, Action::Paste),
+            (GestureDirection::Click, Action::Copy),
+        ]));
         let mut gesture = GestureDispatchState::default();
 
         assert_eq!(
@@ -1110,12 +1112,12 @@ mod tests {
         );
         assert_eq!(
             advance_mode(&mut gesture, 1, &mode, gesture_motion(120, 5)),
-            GestureOutput::Idle,
-            "motion before the hold gate remains a click"
+            GestureOutput::Action(Action::Paste),
+            "trusted HID++ RawXY must not turn a fast swipe into the Click action"
         );
         assert_eq!(
             advance_mode(&mut gesture, 1, &mode, gesture_released()),
-            GestureOutput::Action(Action::Copy)
+            GestureOutput::End
         );
     }
 
