@@ -17,6 +17,7 @@
 
 mod launch_agent;
 mod pairing;
+mod permissions;
 mod self_restart;
 mod server;
 #[cfg(target_os = "macos")]
@@ -129,6 +130,11 @@ async fn run(config: Config) {
     // Startup-only on purpose (like `show_in_menu_bar`): flipping it requires
     // an agent restart, which the config docs state.
     let capture_mouse_events = config.app_settings.capture_mouse_events;
+
+    #[cfg(target_os = "macos")]
+    if permissions::input_monitoring() != openlogi_agent_core::ipc::PermissionStatus::Granted {
+        permissions::request_input_monitoring();
+    }
 
     // The agent owns the CGEventTap, so it must be the binary the user authorizes
     // for Accessibility. Fire the prompt at startup when we're not yet trusted so

@@ -24,7 +24,7 @@ use std::fmt::Write;
 use bincode::Options;
 use openlogi_agent_core::ipc::{
     AgentRequest, AgentSnapshot, AgentStatus, FoundDevice, InventoryHealth, MonitorEvent,
-    PROTOCOL_VERSION, PairingCommandError, PairingFailure, PairingUpdate,
+    PROTOCOL_VERSION, PairingCommandError, PairingFailure, PairingUpdate, PermissionStatus,
 };
 use openlogi_core::config::Lighting;
 use openlogi_core::device::{
@@ -61,7 +61,7 @@ fn assert_wire<T: serde::Serialize>(value: &T, golden: &str) {
 /// that makes that visible in the same diff.
 #[test]
 fn protocol_version_is_pinned() {
-    assert_eq!(PROTOCOL_VERSION, 10);
+    assert_eq!(PROTOCOL_VERSION, 11);
 }
 
 /// tarpc encodes the request enum's variant index, so trait *method order* is
@@ -115,12 +115,16 @@ fn agent_status() {
         // the version must not churn this golden.
         protocol_version: 7,
         agent_version: "0.6.6".into(),
+        input_monitoring: PermissionStatus::Denied,
     };
-    assert_wire(&status, "010001010705302e362e36");
+    assert_wire(&status, "010001010705302e362e3601");
 
     assert_wire(&InventoryHealth::Scanning, "00");
     assert_wire(&InventoryHealth::Ready, "01");
     assert_wire(&InventoryHealth::Unavailable, "02");
+    assert_wire(&PermissionStatus::Granted, "00");
+    assert_wire(&PermissionStatus::Denied, "01");
+    assert_wire(&PermissionStatus::Unknown, "02");
 }
 
 #[test]
@@ -133,10 +137,11 @@ fn agent_snapshot() {
             inventory: InventoryHealth::Ready,
             protocol_version: 7,
             agent_version: "0.6.6".into(),
+            input_monitoring: PermissionStatus::Denied,
         },
         inventory: Vec::new(),
     };
-    assert_wire(&snapshot, "010001010705302e362e3600");
+    assert_wire(&snapshot, "010001010705302e362e360100");
 }
 
 #[test]

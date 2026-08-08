@@ -249,6 +249,7 @@ _version: 1
 "Open": "開啟"
 "Needed for gesture and button remapping (event tap).": "手勢與按鍵重新對應需要此權限（事件監聽）。"
 "Needed to read HID++ data, including Bluetooth-direct mice.": "需要此權限才能讀取 HID++ 資料，包括藍牙直連滑鼠。"
+"Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline.": "請為「OpenLogiAgent」授予「輸入監控」權限。否則 macOS 會阻止背景代理開啟滑鼠；裝置實際上並未離線。"
 "Allows OpenLogi to use CoreBluetooth (not required for HID access).": "允許 OpenLogi 使用 CoreBluetooth（HID 存取不需要）。"
 "Scanning for devices…": "正在掃描裝置…"
 "Connecting to the background service…": "正在連線背景服務…"

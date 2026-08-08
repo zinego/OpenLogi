@@ -249,6 +249,7 @@ _version: 1
 "Open": "Ouvrir"
 "Needed for gesture and button remapping (event tap).": "Requis pour la réaffectation des gestes et des boutons (event tap)."
 "Needed to read HID++ data, including Bluetooth-direct mice.": "Requis pour lire les données HID++, y compris les souris Bluetooth directes."
+"Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline.": "Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline."
 "Allows OpenLogi to use CoreBluetooth (not required for HID access).": "Permet à OpenLogi d'utiliser CoreBluetooth (non requis pour l'accès HID)."
 "Scanning for devices…": "Recherche d'appareils…"
 "Connecting to the background service…": "Connexion au service d'arrière-plan…"

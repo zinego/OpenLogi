@@ -24,17 +24,8 @@
 //! Both are granted by installing the OpenLogi udev rules (see the Linux
 //! install guide).
 
-/// Tri-state result of a permission query.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PermissionStatus {
-    /// The app may use the capability.
-    Granted,
-    /// The user denied it (or it's restricted).
-    Denied,
-    /// Not yet determined, or the platform can't report a definite state.
-    Unknown,
-}
+pub use openlogi_agent_core::ipc::PermissionStatus;
 
 /// A privacy permission with a platform action (deep-link or install guide).
 #[derive(Clone, Copy)]
@@ -47,13 +38,6 @@ pub enum Permission {
     /// macOS: CoreBluetooth authorization.
     #[cfg(target_os = "macos")]
     Bluetooth,
-}
-
-/// Current Input Monitoring ("listen event") status.
-#[cfg(target_os = "macos")]
-#[must_use]
-pub fn input_monitoring() -> PermissionStatus {
-    macos::input_monitoring()
 }
 
 /// Current CoreBluetooth authorization status.
@@ -124,41 +108,18 @@ pub fn open_pane(_permission: Permission) {}
 
 #[cfg(target_os = "macos")]
 mod macos {
-    #![expect(
-        unsafe_code,
-        reason = "IOKit (IOHIDCheckAccess) + CoreBluetooth privacy-permission FFI"
-    )]
+    #![expect(unsafe_code, reason = "CoreBluetooth privacy-permission FFI")]
 
     use objc2::msg_send;
     use objc2::runtime::AnyClass;
 
     use super::PermissionStatus;
 
-    // Query the current HID access without prompting. `IOHIDRequestType`:
-    // PostEvent = 0, ListenEvent = 1. Returned `IOHIDAccessType`: Granted = 0,
-    // Denied = 1, Unknown = 2.
-    #[link(name = "IOKit", kind = "framework")]
-    unsafe extern "C" {
-        fn IOHIDCheckAccess(request_type: u32) -> u32;
-    }
-
     // Force-link CoreBluetooth so the `CBCentralManager` class is normally
     // registered for the `Class::get` lookup in `bluetooth()` (which degrades
     // to `Unknown` rather than panicking if it somehow isn't).
     #[link(name = "CoreBluetooth", kind = "framework")]
     unsafe extern "C" {}
-
-    const REQUEST_TYPE_LISTEN_EVENT: u32 = 1;
-
-    pub(super) fn input_monitoring() -> PermissionStatus {
-        // SAFETY: `IOHIDCheckAccess` is a side-effect-free query taking a valid
-        // `IOHIDRequestType` discriminant.
-        match unsafe { IOHIDCheckAccess(REQUEST_TYPE_LISTEN_EVENT) } {
-            0 => PermissionStatus::Granted,
-            1 => PermissionStatus::Denied,
-            _ => PermissionStatus::Unknown,
-        }
-    }
 
     pub(super) fn bluetooth() -> PermissionStatus {
         // `+[CBManager authorization]` (inherited by CBCentralManager) is a

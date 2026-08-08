@@ -249,6 +249,7 @@ _version: 1
 "Open": "Avaa"
 "Needed for gesture and button remapping (event tap).": "Tarvitaan eleiden ja painikkeiden uudelleenmääritykseen (event tap)."
 "Needed to read HID++ data, including Bluetooth-direct mice.": "Tarvitaan HID++-tietojen lukemiseen, mukaan lukien suoraan Bluetoothiin liitetyt hiiret."
+"Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline.": "Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline."
 "Allows OpenLogi to use CoreBluetooth (not required for HID access).": "Sallii OpenLogin käyttää CoreBluetoothia (ei vaadita HID-käyttöön)."
 "Scanning for devices…": "Etsitään laitteita…"
 "Connecting to the background service…": "Yhdistetään taustapalveluun…"

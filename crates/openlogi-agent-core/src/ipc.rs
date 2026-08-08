@@ -28,7 +28,21 @@ use serde::{Deserialize, Serialize};
 /// v8: [`WriteError`] carries typed HID++ operation failures.
 /// v9: `poll_event_monitor` appended + [`MonitorEvent`] (live event monitor).
 /// v10: `Capabilities::hires_wheel` appended.
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: [`AgentStatus::input_monitoring`] appended.
+pub const PROTOCOL_VERSION: u32 = 11;
+
+/// State of a privacy permission owned by the background agent.
+///
+/// The variant order is wire format and must remain append-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermissionStatus {
+    /// The operating system permits the operation.
+    Granted,
+    /// The operation is currently denied.
+    Denied,
+    /// The operating system has not resolved the request yet.
+    Unknown,
+}
 
 /// Where the agent's device enumeration stands. The distinction matters
 /// because an empty inventory list is ambiguous on its own: the GUI must keep
@@ -62,6 +76,8 @@ pub struct AgentStatus {
     pub inventory: InventoryHealth,
     pub protocol_version: u32,
     pub agent_version: String,
+    /// Input Monitoring status for the agent process that owns HID device I/O.
+    pub input_monitoring: PermissionStatus,
 }
 
 /// Status and inventory as one poll result. Kept together so the GUI never

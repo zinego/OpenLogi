@@ -59,6 +59,7 @@ impl Agent for AgentServer {
             inventory,
             protocol_version: PROTOCOL_VERSION,
             agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            input_monitoring: crate::permissions::input_monitoring(),
         }
     }
 
@@ -163,6 +164,7 @@ impl Agent for AgentServer {
                 inventory: inventory_health,
                 protocol_version: PROTOCOL_VERSION,
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                input_monitoring: crate::permissions::input_monitoring(),
             },
             inventory,
         }

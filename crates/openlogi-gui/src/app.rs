@@ -11,7 +11,7 @@ use gpui_component::{
 use openlogi_core::device::{Capabilities, DeviceInventory, DeviceKind};
 use tracing::info;
 
-use openlogi_agent_core::ipc::InventoryHealth;
+use openlogi_agent_core::ipc::{AgentStatus, InventoryHealth, PermissionStatus};
 
 use crate::app_menu::{CloseWindow, Minimize, Zoom};
 use crate::asset::AssetResolver;
@@ -143,6 +143,25 @@ pub struct AppView {
     accessibility_dismissed: bool,
     /// Which section of the device-detail screen is showing.
     active_tab: DetailTab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionGate {
+    Accessibility,
+    InputMonitoring,
+}
+
+fn permission_gate(
+    accessibility_granted: bool,
+    input_monitoring: PermissionStatus,
+) -> Option<PermissionGate> {
+    if !accessibility_granted {
+        Some(PermissionGate::Accessibility)
+    } else if input_monitoring != PermissionStatus::Granted {
+        Some(PermissionGate::InputMonitoring)
+    } else {
+        None
+    }
 }
 
 impl AppView {
@@ -297,6 +316,65 @@ impl AppView {
             )
             .into_any_element()
     }
+
+    fn input_monitoring_gate(pal: Palette) -> AnyElement {
+        v_flex()
+            .size_full()
+            .bg(pal.bg)
+            .text_color(pal.text_primary)
+            .items_center()
+            .justify_center()
+            .gap_4()
+            .p_8()
+            .child(
+                Icon::new(IconName::TriangleAlert)
+                    .size_8()
+                    .text_color(rgb(theme::STATUS_CONNECTING)),
+            )
+            .child(div().text_title().child(tr!("Input Monitoring")))
+            .child(div().text_body().text_color(pal.text_muted).child(tr!(
+                "Needed to read HID++ data, including Bluetooth-direct mice."
+            )))
+            .child(
+                div()
+                    .max_w(px(440.))
+                    .text_body()
+                    .text_color(pal.text_muted)
+                    .child(tr!(
+                        "Grant Input Monitoring to “OpenLogiAgent”. Without it, macOS blocks the background agent from opening the mouse; the device is not actually offline."
+                    )),
+            )
+            .child(
+                Button::new("open-input-monitoring")
+                    .primary()
+                    .icon(IconName::Settings)
+                    .label(tr!("Open System Settings to grant access"))
+                    .on_click(|_, _, _| {
+                        crate::platform::permissions::open_pane(
+                            crate::platform::permissions::Permission::InputMonitoring,
+                        );
+                    }),
+            )
+            .child(div().text_caption().text_color(pal.text_muted).child(tr!(
+                "Takes effect automatically once granted — no restart needed."
+            )))
+            .into_any_element()
+    }
+
+    fn active_permission_gate(
+        &self,
+        status: &AgentStatus,
+        pal: Palette,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        match permission_gate(status.accessibility_granted, status.input_monitoring) {
+            Some(PermissionGate::Accessibility) if !self.accessibility_dismissed => {
+                Some(Self::accessibility_gate(pal, cx))
+            }
+            Some(PermissionGate::InputMonitoring) => Some(Self::input_monitoring_gate(pal)),
+            Some(PermissionGate::Accessibility) | None => None,
+        }
+    }
 }
 
 fn request_accessibility(cx: &mut App) {
@@ -382,11 +460,9 @@ impl Render for AppView {
         };
 
         let granted = status.accessibility_granted;
-        if !granted && !self.accessibility_dismissed {
+        if let Some(gate) = self.active_permission_gate(&status, pal, cx) {
             window.set_window_title("OpenLogi");
-            return root
-                .child(Self::accessibility_gate(pal, cx))
-                .into_any_element();
+            return root.child(gate).into_any_element();
         }
 
         let has_device = cx
@@ -469,9 +545,29 @@ impl Render for AppView {
 #[cfg(test)]
 mod tests {
     use super::home::connection_icon_path;
-    use super::{Capabilities, DetailTab, DeviceKind, DeviceRecord};
+    use super::{
+        Capabilities, DetailTab, DeviceKind, DeviceRecord, PermissionGate, permission_gate,
+    };
+    use openlogi_agent_core::ipc::PermissionStatus;
     use openlogi_core::device::DeviceTransports;
     use openlogi_hid::DeviceRoute;
+
+    #[test]
+    fn agent_permissions_gate_before_device_offline_state() {
+        assert_eq!(
+            permission_gate(false, PermissionStatus::Denied),
+            Some(PermissionGate::Accessibility)
+        );
+        assert_eq!(
+            permission_gate(true, PermissionStatus::Denied),
+            Some(PermissionGate::InputMonitoring)
+        );
+        assert_eq!(
+            permission_gate(true, PermissionStatus::Unknown),
+            Some(PermissionGate::InputMonitoring)
+        );
+        assert_eq!(permission_gate(true, PermissionStatus::Granted), None);
+    }
 
     #[test]
     fn connection_icon_matches_route() {

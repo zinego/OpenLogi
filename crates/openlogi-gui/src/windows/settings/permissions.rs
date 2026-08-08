@@ -48,7 +48,11 @@ pub(super) fn permissions_page(pal: Palette) -> SettingPage {
                 tr!("Input Monitoring"),
                 tr!("Needed to read HID++ data, including Bluetooth-direct mice."),
                 Permission::InputMonitoring,
-                |_| permissions::input_monitoring(),
+                |cx| {
+                    cx.try_global::<AppState>()
+                        .and_then(AppState::agent_status)
+                        .map_or(PermissionStatus::Unknown, |status| status.input_monitoring)
+                },
                 pal,
             ))
             .item(permission_item(
