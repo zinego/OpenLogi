@@ -1,6 +1,8 @@
 /// Raw-XY travel threshold that activates Pan. Motion below the boundary stays
-/// buffered as a click candidate; reaching it flushes the buffered motion.
-pub const PAN_DEADZONE: i32 = 4;
+/// buffered as a click candidate; reaching it flushes the buffered motion. The
+/// acceptance M650 produced up to 22 units of settling travel during a physical
+/// click, so 32 separates that jitter from a deliberate drag.
+pub const PAN_DEADZONE: i32 = 32;
 
 /// Typed result of one Pan state-machine transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -126,6 +128,36 @@ mod tests {
         pan.begin();
         assert_eq!(pan.accumulate(1, -1), PanOutput::Idle);
         assert_eq!(pan.accumulate(1, 1), PanOutput::Idle);
+        assert_eq!(pan.end(), PanOutput::Click);
+    }
+
+    #[test]
+    fn physical_m650_click_jitter_stays_a_click() {
+        // Captured from a 180 ms physical Forward click on the acceptance M650.
+        // The hand settles back near its origin, so this must not become Pan.
+        let trace = [
+            (-4, -22),
+            (-2, 3),
+            (-1, 4),
+            (-2, 4),
+            (-1, 2),
+            (-1, 2),
+            (0, 1),
+            (0, 1),
+            (0, 1),
+            (1, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (1, 0),
+            (0, 1),
+            (-1, 0),
+        ];
+        let mut pan = PanAccumulator::default();
+        pan.begin();
+        for (x, y) in trace {
+            assert_eq!(pan.accumulate(x, y), PanOutput::Idle);
+        }
         assert_eq!(pan.end(), PanOutput::Click);
     }
 

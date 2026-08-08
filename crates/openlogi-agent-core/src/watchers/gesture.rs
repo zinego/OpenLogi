@@ -952,14 +952,11 @@ mod tests {
                 &modes,
                 CapturedInput::GestureMotion {
                     button: ButtonId::Forward,
-                    delta_x: 4,
+                    delta_x: 40,
                     delta_y: -9,
                 },
             ),
-            GestureOutput::PanDelta {
-                x: PAN_DEADZONE,
-                y: -9,
-            }
+            GestureOutput::PanDelta { x: 40, y: -9 }
         );
     }
 
@@ -1001,11 +998,8 @@ mod tests {
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_mode(&mut gesture, 1, &mode, gesture_motion(4, -9)),
-            GestureOutput::PanDelta {
-                x: PAN_DEADZONE,
-                y: -9,
-            }
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(40, -9)),
+            GestureOutput::PanDelta { x: 40, y: -9 }
         );
         assert_eq!(
             advance_mode(&mut gesture, 1, &mode, gesture_released()),
@@ -1095,11 +1089,8 @@ mod tests {
             GestureOutput::Idle
         );
         assert_eq!(
-            advance_mode(&mut gesture, 1, &mode, gesture_motion(4, -9)),
-            GestureOutput::PanDelta {
-                x: PAN_DEADZONE,
-                y: -9,
-            }
+            advance_mode(&mut gesture, 1, &mode, gesture_motion(40, -9)),
+            GestureOutput::PanDelta { x: 40, y: -9 }
         );
         assert_eq!(
             advance_mode(&mut gesture, 1, &mode, gesture_released()),
