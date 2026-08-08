@@ -29,6 +29,13 @@ fn back_reports_press_motion_and_release_with_its_identity() {
     handle_reprog(&mut acc, diverted(&[back]), &gestures, &[], &tx);
     handle_reprog(
         &mut acc,
+        RawControlEvent::RawXy { dx: 300, dy: -400 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(
+        &mut acc,
         RawControlEvent::RawXy { dx: -120, dy: 5 },
         &gestures,
         &[],
@@ -61,6 +68,13 @@ fn forward_reports_press_motion_and_release_with_its_identity() {
     handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
     handle_reprog(
         &mut acc,
+        RawControlEvent::RawXy { dx: -300, dy: 400 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(
+        &mut acc,
         RawControlEvent::RawXy { dx: 10, dy: -20 },
         &gestures,
         &[],
@@ -76,6 +90,45 @@ fn forward_reports_press_motion_and_release_with_its_identity() {
                 button: ButtonId::Forward,
                 delta_x: 10,
                 delta_y: -20,
+            }),
+            Ok(CapturedInput::GestureReleased(ButtonId::Forward)),
+        ]
+    );
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn first_raw_xy_after_press_is_discarded_as_stale_device_accumulation() {
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let gestures = gesture_controls(&[ButtonId::Forward]);
+    let forward = reprog_controls::FORWARD_BUTTON_CID;
+    let mut acc = CaptureAccum::default();
+
+    handle_reprog(&mut acc, diverted(&[forward]), &gestures, &[], &tx);
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: -236, dy: -406 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(
+        &mut acc,
+        RawControlEvent::RawXy { dx: -1, dy: 2 },
+        &gestures,
+        &[],
+        &tx,
+    );
+    handle_reprog(&mut acc, diverted(&[]), &gestures, &[], &tx);
+
+    assert_eq!(
+        [rx.try_recv(), rx.try_recv(), rx.try_recv()],
+        [
+            Ok(CapturedInput::GesturePressed(ButtonId::Forward)),
+            Ok(CapturedInput::GestureMotion {
+                button: ButtonId::Forward,
+                delta_x: -1,
+                delta_y: 2,
             }),
             Ok(CapturedInput::GestureReleased(ButtonId::Forward)),
         ]

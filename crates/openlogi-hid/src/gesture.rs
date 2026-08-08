@@ -103,6 +103,9 @@ struct CaptureAccum {
     closed: bool,
     /// The sole gesture control currently allowed to own raw-XY events.
     active_gesture: Option<ButtonId>,
+    /// Whether the next raw-XY report belongs to the device's pre-press
+    /// accumulator and must not enter the new gesture lifecycle.
+    discard_next_raw_xy: bool,
     /// Whether any DPI/ModeShift control was held in the last event — for
     /// rising-edge press detection.
     dpi_down: bool,
@@ -501,10 +504,12 @@ fn handle_reprog(
             let ambiguous = first.is_some() && next.is_none();
 
             if ambiguous {
+                acc.discard_next_raw_xy = false;
                 if let Some(active) = acc.active_gesture.take() {
                     let _ = sink.send(CapturedInput::GestureCancelled(active));
                 }
             } else if next != acc.active_gesture {
+                acc.discard_next_raw_xy = false;
                 if let Some(active) = acc.active_gesture.take() {
                     let end = if next.is_some() {
                         CapturedInput::GestureCancelled(active)
@@ -515,6 +520,7 @@ fn handle_reprog(
                 }
                 if let Some(button) = next {
                     acc.active_gesture = Some(button);
+                    acc.discard_next_raw_xy = true;
                     let _ = sink.send(CapturedInput::GesturePressed(button));
                 }
             }
@@ -527,6 +533,10 @@ fn handle_reprog(
         }
         RawControlEvent::RawXy { dx, dy } => {
             if let Some(button) = acc.active_gesture {
+                if acc.discard_next_raw_xy {
+                    acc.discard_next_raw_xy = false;
+                    return;
+                }
                 let _ = sink.send(CapturedInput::GestureMotion {
                     button,
                     delta_x: dx,
